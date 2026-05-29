@@ -9,3 +9,4 @@ categories_zh.json
 profile_ko.json
 .session*
 error.log
+.uploader_state.pkl
