@@ -468,6 +468,8 @@ def phase1_x_attr(prod, w):
 
 
 def phase1_y_list(prod, w, x):
+    from config_manager import load_config
+    qty = load_config().get("default_quantity", 50)
     size_noise = ["차트", "사이즈", "표를", "cm", "inch", "길이", "사이즈표", "상세"]
     lines = []
     for color, size, price in prod.color_sizes:
@@ -480,13 +482,13 @@ def phase1_y_list(prod, w, x):
                 break
 
         if x == "색상,사이즈":
-            lines.append(f"{color_kr},{size_clean},정상,노출,100,100")
+            lines.append(f"{color_kr},{size_clean},정상,노출,{qty},{qty}")
         elif x == "색상":
-            lines.append(f"{color_kr},정상,노출,100,100")
+            lines.append(f"{color_kr},정상,노출,{qty},{qty}")
         elif x == "사이즈":
-            lines.append(f"{size_clean},정상,노출,100,100")
+            lines.append(f"{size_clean},정상,노출,{qty},{qty}")
         else:
-            lines.append("정상,노출,100,100")
+            lines.append(f"정상,노출,{qty},{qty}")
     return "\n".join(lines)
 
 
