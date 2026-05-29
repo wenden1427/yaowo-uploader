@@ -1,7 +1,7 @@
 """Auto-updater for 耀我科技上传器."""
 
 import os, json, urllib.request, urllib.error, zipfile, shutil, subprocess, sys, tkinter as tk
-from tkinter import messagebox, tempfile
+from tkinter import messagebox; import tempfile
 
 REPO_API = "https://api.github.com/repos/wenden1427/yaowo-uploader/commits/main"
 REPO_ZIP = "https://github.com/wenden1427/yaowo-uploader/archive/refs/heads/main.zip"
