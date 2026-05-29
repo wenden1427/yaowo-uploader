@@ -1,0 +1,11 @@
+python-portable/
+__pycache__/
+*.pyc
+*.zip
+config.yaml
+prompts.yaml
+storage/
+categories_zh.json
+profile_ko.json
+.session*
+error.log
