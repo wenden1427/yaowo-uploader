@@ -22,7 +22,19 @@ def _get_remote_version():
             "User-Agent": "YaoWo-Uploader-Updater/1.0",
             "Accept": "application/vnd.github.v3+json",
         })
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        # Try proxy first (common in China), fall back to direct
+        opener = None
+        try:
+            from config_manager import detect_proxy
+            proxy = detect_proxy()
+            if proxy:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        except Exception:
+            pass
+        if opener is None:
+            opener = urllib.request.build_opener()
+        with opener.open(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return data.get("sha", "")
     except Exception:
