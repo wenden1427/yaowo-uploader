@@ -143,6 +143,14 @@ class UploaderApp:
                                          state="readonly", width=10)
         self._img_api_cb.pack(side=tk.LEFT, padx=2)
         self._img_api_cb.bind("<<ComboboxSelected>>", self._on_img_api_changed)
+        # Platform selector for collector table format
+        tb.Label(tbar, text="  平台:").pack(side=tk.LEFT, padx=(8,2))
+        self._platform_var = tk.StringVar(value="shein")
+        self._platform_cb = tb.Combobox(tbar, textvariable=self._platform_var,
+                                          values=["shein", "aliexpress"],
+                                          state="readonly", width=10)
+        self._platform_cb.pack(side=tk.LEFT, padx=2)
+        self._platform_cb.bind("<<ComboboxSelected>>", self._on_platform_changed)
         tb.Separator(tbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         self._start_btn = tb.Button(tbar, text="开 始", command=self._start_processing,
                                     bootstyle="success")
@@ -1143,6 +1151,7 @@ ParentSKU 并跳过，只处理剩余的。
         if not self.source_path:
             return
         try:
+            platform = self._platform_var.get()
             from openpyxl import load_workbook
             wb = load_workbook(self.source_path, read_only=True)
             ws = wb.active
@@ -1161,6 +1170,7 @@ ParentSKU 并跳过，只处理剩余的。
                         price=str(row[12] or ""),
                         url=str(row[11] or ""),
                         main_img=str(row[17] or ""),
+                        platform=platform,
                     )
                 color = str(row[9] or "")
                 size = str(row[10] or "")
@@ -1177,11 +1187,47 @@ ParentSKU 并跳过，只处理剩余的。
                     u = str(row[i] or "")
                     if u and u.startswith("http") and u not in groups[psku].extra_imgs:
                         groups[psku].extra_imgs.append(u)
+                # AliExpress: read description images from cols 67-86
+                if platform == "aliexpress":
+                    for i in range(66, 86):
+                        u = str(row[i] or "") if i < len(row) else ""
+                        if u and u.startswith("http") and u not in groups[psku].desc_images:
+                            groups[psku].desc_images.append(u)
+            # Dedup (color,size) combos
+            for p in groups.values():
+                seen, deduped = set(), []
+                for cs in p.color_sizes:
+                    key = (cs[0], cs[1])
+                    if key not in seen:
+                        seen.add(key)
+                        deduped.append(cs)
+                p.color_sizes = deduped
             self.products = list(groups.values())
+            # Store original main_img for platform switching
+            self._orig_main_img = {p.parent_sku: p.main_img for p in self.products}
+            # Apply initial platform setting
+            self._apply_platform_images()
             self._refresh_list()
             messagebox.showinfo("提示", f"已加载 {len(self.products)} 个产品")
         except Exception as e:
             messagebox.showerror("加载失败", str(e))
+
+    def _apply_platform_images(self):
+        """Swap main_img based on platform: AliExpress uses 1st variant image."""
+        platform = self._platform_var.get()
+        for p in self.products:
+            p.platform = platform
+            orig = self._orig_main_img.get(p.parent_sku, "")
+            if platform == "aliexpress" and p.variant_imgs:
+                p.main_img = p.variant_imgs[0]
+            else:
+                p.main_img = orig
+
+    def _on_platform_changed(self, event=None):
+        if not self.products:
+            return
+        self._apply_platform_images()
+        self._refresh_list()
 
     def _refresh_list(self):
         """Rebuild Treeview from self.products."""
