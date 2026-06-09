@@ -49,8 +49,11 @@ def _url_stem(url):
 
 # ---- Excel Read/Write ----
 
-def load_products(source_path):
-    """Load products from scraped Excel, grouping by ParentSKU."""
+def load_products(source_path, platform="shein"):
+    """Load products from scraped Excel, grouping by ParentSKU.
+
+    For AliExpress: also reads description images from cols 67-86.
+    """
     wb = load_workbook(source_path, read_only=True)
     ws = wb.active
     rows = ws.iter_rows(min_row=2, values_only=True)  # generator, not list
@@ -67,6 +70,7 @@ def load_products(source_path):
                 price=str(row[12] or ""),
                 url=str(row[11] or ""),
                 main_img=str(row[17] or ""),
+                platform=platform,
             )
         color = str(row[9] or "")
         size = str(row[10] or "")
@@ -83,6 +87,26 @@ def load_products(source_path):
             u = str(row[i] or "")
             if u and u.startswith("http") and u not in groups[psku].extra_imgs:
                 groups[psku].extra_imgs.append(u)
+        # AliExpress: read description images from cols 67-86 (0-indexed: 66-85)
+        if platform == "aliexpress":
+            for i in range(66, 86):
+                u = str(row[i] or "") if i < len(row) else ""
+                if u and u.startswith("http") and u not in groups[psku].desc_images:
+                    groups[psku].desc_images.append(u)
+    # Dedup (color,size) combos within each product
+    for p in groups.values():
+        seen, deduped = set(), []
+        for cs in p.color_sizes:
+            key = (cs[0], cs[1])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(cs)
+        p.color_sizes = deduped
+    # AliExpress: main_img = 1st variant image
+    if platform == "aliexpress":
+        for p in groups.values():
+            if p.variant_imgs:
+                p.main_img = p.variant_imgs[0]
     return list(groups.values())
 
 
@@ -495,12 +519,11 @@ def phase1_y_list(prod, w, x):
 # ---- Phase 2: Concurrent per-batch ----
 
 def _gen_main_image(prod, prompt, storage):
-    """Generate main image using configured image API. Thread-safe.
-
-    Retries 2 times on failure. Returns None if all attempts fail.
-    Does NOT fall back to original image.
-    """
-    refs = [prod.main_img] + prod.extra_imgs[:3]  # max 4 total
+    """Generate main image. AliExpress: 1st variant image as reference. Shein: main+extra."""
+    if prod.platform == "aliexpress":
+        refs = prod.variant_imgs[:1] if prod.variant_imgs else [prod.main_img]
+    else:
+        refs = [prod.main_img] + prod.extra_imgs[:3]  # max 4 total
     refs = list(dict.fromkeys(refs))  # dedup keep order
     last_err = None
     for attempt in range(3):  # initial + 2 retries
@@ -522,8 +545,14 @@ def _gen_detail_html(prod, all_products, storage):
     try:
         import io
         from PIL import Image
-        # Collect images from all same-ParentSKU products
-        img_urls = [prod.main_img] + prod.extra_imgs
+        # AliExpress: use desc_images if available, else fallback to all images+variant
+        if prod.platform == "aliexpress":
+            if prod.desc_images:
+                img_urls = list(prod.desc_images)
+            else:
+                img_urls = prod.extra_imgs + prod.variant_imgs
+        else:
+            img_urls = [prod.main_img] + prod.extra_imgs
         for p2 in all_products:
             if p2.parent_sku == prod.parent_sku:
                 for u in p2.extra_imgs:
@@ -560,6 +589,12 @@ def _gen_detail_html(prod, all_products, storage):
 
 def _collect_variant_imgs(prod):
     """Collect variant images for AA column."""
+    # AliExpress: remaining variant images after the 1st (used as main)
+    if prod.platform == "aliexpress":
+        if len(prod.variant_imgs) > 1:
+            return ",".join(prod.variant_imgs[1:])
+        return ""
+    # Shein: existing logic
     main_stem = _url_stem(prod.main_img)
     variant_urls = []
     for u in prod.variant_imgs:

@@ -63,10 +63,10 @@ def check_and_update(root):
     )
     if not result:
         return True
-    return _do_update()
+    return _do_update(remote)
 
 
-def _do_update():
+def _do_update(remote_sha):
     try:
         tmp = os.path.join(tempfile.gettempdir(), "yaowo_uploader_update.zip")
         extract_dir = os.path.join(tempfile.gettempdir(), "yaowo_uploader_update_extract")
@@ -97,6 +97,7 @@ def _do_update():
         os.remove(tmp)
         shutil.rmtree(extract_dir)
 
+        _save_version(remote_sha)
         subprocess.Popen([sys.executable, os.path.join(SCRIPT_DIR, "main.py")])
         sys.exit(0)
     except Exception as e:

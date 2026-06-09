@@ -34,6 +34,8 @@ class Product:
     main_img: str = ""
     extra_imgs: list[str] = field(default_factory=list)
     variant_imgs: list[str] = field(default_factory=list)
+    desc_images: list[str] = field(default_factory=list)
+    platform: str = "shein"
     price: str = ""
     url: str = ""
     status: ProductStatus = ProductStatus.PENDING
