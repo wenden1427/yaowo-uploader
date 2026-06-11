@@ -491,19 +491,48 @@ def phase1_x_attr(prod, w):
         return "색상,사이즈"
 
 
+# Cache for DeepSeek abbreviations (shared across all products)
+_ABBREV_CACHE = {}
+
+def _abbreviate_if_long(name):
+    """If *name* exceeds 50 UTF-8 bytes, ask DeepSeek for a short Korean abbreviation.
+    Returns the abbreviated string (or original if short enough / API fails).
+    """
+    if len(name.encode('utf-8')) <= 50:
+        return name
+    if name in _ABBREV_CACHE:
+        return _ABBREV_CACHE[name]
+    try:
+        prompt = (
+            "다음 옵션명을 50바이트(UTF-8) 이내의 짧은 한국어로 축약해 주세요.\n"
+            "원래 의미를 유지하고, 핵심 키워드만 남기세요.\n"
+            "설명 없이 축약된 텍스트만 출력하세요.\n"
+            f"옵션명: {name}\n축약:"
+        )
+        short = deepseek_chat(prompt, max_tokens=80, temp=0.2).strip()
+        # If API returned something weird, keep original
+        if short and 1 < len(short) < len(name):
+            _ABBREV_CACHE[name] = short
+            return short
+    except Exception:
+        pass
+    _ABBREV_CACHE[name] = name  # Don't retry failures
+    return name
+
+
 def phase1_y_list(prod, w, x):
     from config_manager import load_config
     qty = load_config().get("default_quantity", 50)
     size_noise = ["차트", "사이즈", "표를", "cm", "inch", "길이", "사이즈표", "상세"]
     lines = []
     for color, size, price in prod.color_sizes:
-        color_kr = color  # GUI handler provides translate_fn
-        # Filter noise from size
+        color_kr = _abbreviate_if_long(color)
         size_clean = size
         for noise in size_noise:
             if noise.lower() in str(size).lower():
                 size_clean = ""
                 break
+        size_clean = _abbreviate_if_long(size_clean) if size_clean else size_clean
 
         if x == "색상,사이즈":
             lines.append(f"{color_kr},{size_clean},정상,노출,{qty},{qty}")
@@ -514,6 +543,51 @@ def phase1_y_list(prod, w, x):
         else:
             lines.append(f"정상,노출,{qty},{qty}")
     return "\n".join(lines)
+
+
+# ---- Image quality helpers ----
+
+def _ensure_min_dimensions(image_bytes):
+    """Resize image so both width and height are >= 600px.
+    Returns resized image bytes (JPEG format).
+    """
+    from PIL import Image
+    img = Image.open(io.BytesIO(image_bytes))
+    w, h = img.size
+    if w >= 600 and h >= 600:
+        return image_bytes
+    # Scale up so the SMALLER dimension becomes 600
+    scale = max(600 / w, 600 / h)
+    new_w = max(int(w * scale), 600)
+    new_h = max(int(h * scale), 600)
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92, optimize=True)
+    return buf.getvalue()
+
+
+def _ensure_under_2mb(image_bytes):
+    """Compress image_bytes to under 2 MB using PIL."""
+    if len(image_bytes) <= 2_000_000:
+        return image_bytes
+    from PIL import Image
+    img = Image.open(io.BytesIO(image_bytes))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=60, optimize=True)
+    compressed = buf.getvalue()
+    if len(compressed) > 2_000_000:
+        img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=50, optimize=True)
+        compressed = buf.getvalue()
+    return compressed
+
+
+def _ensure_image_meets_spec(image_bytes):
+    """Ensure image meets ESM specs: >= 600x600, <= 2MB."""
+    fixed = _ensure_min_dimensions(image_bytes)
+    fixed = _ensure_under_2mb(fixed)
+    return fixed
 
 
 # ---- Phase 2: Concurrent per-batch ----
@@ -573,11 +647,14 @@ def _gen_detail_html(prod, all_products, storage):
                 img_data = download_image(u)
                 img = Image.open(io.BytesIO(img_data))
                 w, h = img.size
-                new_h = int(h * 800 / w) if w else 600
+                # Resize to width 800; ensure height >= 600 (ESM minimum)
+                new_h = max(int(h * 800 / w) if w else 600, 600)
                 img = img.resize((800, new_h), Image.LANCZOS)
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=85)
-                cloud_url = storage.upload(buf.getvalue(), f"detail_{int(time.time())}.jpg")
+                # Ensure meets spec before upload
+                safe = _ensure_image_meets_spec(buf.getvalue())
+                cloud_url = storage.upload(safe, f"detail_{int(time.time())}.jpg")
                 html_parts.append(f'<P><img src="{cloud_url}" width="800"></P>')
             except Exception:
                 html_parts.append(f'<P><img src="{u}" width="800"></P>')
@@ -587,25 +664,29 @@ def _gen_detail_html(prod, all_products, storage):
         return ""
 
 
-def _collect_variant_imgs(prod):
-    """Collect variant images for AA column."""
-    # AliExpress: remaining variant images after the 1st (used as main)
+def _collect_variant_imgs(prod, storage):
+    """Collect variant images for AA column. Downloads, ensures >=600x600 / <=2MB,
+    uploads to Cloudinary, returns comma-separated Cloudinary URLs."""
+    # Gather source URLs
     if prod.platform == "aliexpress":
-        if len(prod.variant_imgs) > 1:
-            return ",".join(prod.variant_imgs[1:])
-        return ""
-    # Shein: existing logic
-    main_stem = _url_stem(prod.main_img)
-    variant_urls = []
-    for u in prod.variant_imgs:
-        if _url_stem(u) != main_stem:
-            variant_urls.append(u)
-    # If no variant images and single-color, add up to 2 extra images
-    if not variant_urls and len(prod.colors) <= 1:
-        for u in prod.extra_imgs[:2]:
-            if _url_stem(u) != main_stem and u not in variant_urls:
-                variant_urls.append(u)
-    return ",".join(variant_urls)
+        urls = prod.variant_imgs[1:] if len(prod.variant_imgs) > 1 else []
+    else:
+        main_stem = _url_stem(prod.main_img)
+        urls = [u for u in prod.variant_imgs if _url_stem(u) != main_stem]
+    if not urls and len(prod.colors) <= 1:
+        urls = [u for u in prod.extra_imgs[:2]
+                if _url_stem(u) != _url_stem(prod.main_img)][:2]
+    # Download, fix, upload each to Cloudinary
+    safe_urls = []
+    for u in urls:
+        try:
+            img_data = download_image(u)
+            safe = _ensure_image_meets_spec(img_data)
+            cloud_url = storage.upload(safe, f"var_{int(time.time())}.jpg")
+            safe_urls.append(cloud_url)
+        except Exception:
+            safe_urls.append(u)  # Keep original URL on failure
+    return ",".join(safe_urls) if safe_urls else ""
 
 
 # ---- Main Pipeline ----
@@ -775,7 +856,7 @@ class ProcessingPipeline:
                 detail_count = ab_results[idx].count("<P>") if ab_results[idx] else 1
 
                 prod.status = ProductStatus.PHASE2_VARIANT
-                aa_results[idx] = _collect_variant_imgs(prod)
+                aa_results[idx] = _collect_variant_imgs(prod, storage)
                 self.progress_cb(idx + 1, total, f"#{idx + 1} 生成完成")
 
                 return 1, max(detail_count, 1)  # (hm_count, up_count)
