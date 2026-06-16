@@ -52,7 +52,7 @@ class UploaderApp:
         self._pause_event = threading.Event()
         self._pause_event.set()
         # Stats
-        self._stats = {"deepseek": 0, "haomingai": 0, "upload": 0}
+        self._stats = {"deepseek": 0, "image": 0, "upload": 0}
         # Restore saved state
         if restore_state:
             self._restore_state(restore_state)
@@ -136,10 +136,12 @@ class UploaderApp:
         self._img_profile_cb.pack(side=tk.LEFT, padx=2)
         # Image API selector
         cfg = load_config()
-        current_api = cfg.get("image_api", "haomingai")
+        current_api = cfg.get("image_api", "routeapi")
+        if current_api not in ("routeapi", "hfsyapi"):
+            current_api = "routeapi"
         self._img_api_var = tk.StringVar(value=current_api)
         self._img_api_cb = tb.Combobox(tbar, textvariable=self._img_api_var,
-                                         values=["haomingai", "hfsyapi"],
+                                         values=["routeapi", "hfsyapi"],
                                          state="readonly", width=10)
         self._img_api_cb.pack(side=tk.LEFT, padx=2)
         self._img_api_cb.bind("<<ComboboxSelected>>", self._on_img_api_changed)
@@ -216,9 +218,14 @@ class UploaderApp:
         if title_p in self._title_profile_cb["values"]:
             self._title_profile_var.set(title_p)
         # Restore stats
-        self._stats = state.get("stats", {"deepseek": 0, "haomingai": 0, "upload": 0})
+        saved_stats = state.get("stats", {})
+        self._stats = {
+            "deepseek": saved_stats.get("deepseek", 0),
+            "image": saved_stats.get("image", 0),
+            "upload": saved_stats.get("upload", 0),
+        }
         self._stat_label.configure(
-            text=f"DeepSeek: {self._stats['deepseek']} | 生图: {self._stats['haomingai']} | 上传: {self._stats['upload']}")
+            text=f"DeepSeek: {self._stats['deepseek']} | 生图: {self._stats['image']} | 上传: {self._stats['upload']}")
         # Set output path from saved state
         output = state.get("output_path", "")
         if output:
@@ -399,6 +406,7 @@ class UploaderApp:
         # Fields
         self._pv_fields = {}
         for label, key, ro in [("Parent SKU", "parent_sku", False),
+                                ("主图来源", "main_source", True),
                                 ("AI 标题", "ai_title", True),
                                 ("类目", "category", True),
                                 ("价格", "price", True),
@@ -423,11 +431,18 @@ class UploaderApp:
 
     def _show_preview(self, prod):
         """Populate preview panel with product data + image previews."""
+        self._preview_token = getattr(self, "_preview_token", 0) + 1
+        token = self._preview_token
         # Parent SKU (selectable for copy)
         self._pv_fields["parent_sku"].configure(state="normal")
         self._pv_fields["parent_sku"].delete(0, tk.END)
         self._pv_fields["parent_sku"].insert(0, prod.parent_sku)
         self._pv_fields["parent_sku"].configure(state="readonly")
+
+        self._pv_fields["main_source"].configure(state="normal")
+        self._pv_fields["main_source"].delete(0, tk.END)
+        self._pv_fields["main_source"].insert(0, self._main_image_source_text(prod))
+        self._pv_fields["main_source"].configure(state="readonly")
 
         self._pv_fields["ai_title"].configure(state="normal")
         self._pv_fields["ai_title"].delete(0, tk.END)
@@ -457,10 +472,10 @@ class UploaderApp:
         self._img_orig.create_text(90, 90, text="加载中...", fill="#888")
         self._img_gen.delete("all")
         self._img_gen.create_text(90, 90, text="加载中...", fill="#888")
-        threading.Thread(target=self._load_preview_images, args=(prod,), daemon=True).start()
+        threading.Thread(target=self._load_preview_images, args=(prod, token), daemon=True).start()
         # Also load reference image for test panel
         if prod.main_img:
-            threading.Thread(target=self._load_test_ref_image, args=(prod.main_img,), daemon=True).start()
+            threading.Thread(target=self._load_test_ref_image, args=(prod.main_img, token), daemon=True).start()
 
         var_text = prod.result.get("Y", "\n".join(
             f"{c}, {s}, 정상, 노출, 100, 100" for c, s, _ in prod.color_sizes
@@ -470,6 +485,13 @@ class UploaderApp:
 
         self._log_text.delete("1.0", tk.END)
         self._log_text.insert("1.0", "\n".join(prod.logs[-10:]))
+
+    def _main_image_source_text(self, prod):
+        shein_url = self._get_shein_main_img(prod)
+        ali_url = self._get_aliexpress_main_img(prod)
+        if prod.platform == "aliexpress":
+            return f"AliExpress 第一张变种图: {prod.main_img} | Shein主图: {shein_url}"
+        return f"Shein 采集表主图列: {prod.main_img} | AliExpress候选: {ali_url}"
 
     def _regenerate_main_image(self):
         """Re-generate main image for the selected product."""
@@ -488,6 +510,7 @@ class UploaderApp:
         try:
             from api_client import generate_image, create_storage_provider
             from config_manager import load_config, load_prompts
+            from processor import build_generation_prompt, collect_generation_refs
 
             cfg = load_config()
             prompts = load_prompts()
@@ -495,9 +518,8 @@ class UploaderApp:
             prompt_text = prompts.get(prompt_key, prompts.get("generic", ""))
             storage = create_storage_provider(cfg)
 
-            refs = [prod.main_img] + prod.extra_imgs[:3]
-            refs = list(dict.fromkeys(refs))
-            refs = [u for u in refs if u and u.startswith("http")]
+            refs = collect_generation_refs(prod)
+            prompt_text = build_generation_prompt(prompt_text)
 
             img_bytes = generate_image(prompt_text, refs)
 
@@ -541,44 +563,52 @@ class UploaderApp:
         canvas.delete("all")
         canvas.create_image(cw // 2, ch // 2, image=tk_img, anchor=tk.CENTER)
 
-    def _load_preview_images(self, prod):
+    def _is_current_preview(self, token):
+        return token == getattr(self, "_preview_token", None)
+
+    def _load_preview_images(self, prod, token):
         """Download and display product images in preview panel (background thread)."""
         try:
             from api_client import download_image
             if prod.main_img:
                 img_data = download_image(prod.main_img)
-                self.root.after(0, lambda: self._canvas_show_image(
+                self.root.after(0, lambda: self._is_current_preview(token) and self._canvas_show_image(
                     self._img_orig, img_data, prod.parent_sku + "_orig"))
             else:
-                self.root.after(0, lambda: self._img_orig.delete("all") or
-                    self._img_orig.create_text(90, 90, text="[无图片]", fill="#888"))
+                self.root.after(0, lambda: self._is_current_preview(token) and (
+                    self._img_orig.delete("all") or
+                    self._img_orig.create_text(90, 90, text="[无图片]", fill="#888")))
 
             gen_url = prod.result.get("Z", "")
             if gen_url and gen_url.startswith("http"):
                 try:
                     img_data = download_image(gen_url)
-                    self.root.after(0, lambda: self._canvas_show_image(
+                    self.root.after(0, lambda: self._is_current_preview(token) and self._canvas_show_image(
                         self._img_gen, img_data, prod.parent_sku + "_gen"))
                 except Exception:
-                    self.root.after(0, lambda: self._img_gen.delete("all") or
-                        self._img_gen.create_text(90, 90, text="[加载失败]", fill="#888"))
+                    self.root.after(0, lambda: self._is_current_preview(token) and (
+                        self._img_gen.delete("all") or
+                        self._img_gen.create_text(90, 90, text="[加载失败]", fill="#888")))
             else:
-                self.root.after(0, lambda: self._img_gen.delete("all") or
-                    self._img_gen.create_text(90, 90, text="[待生成]", fill="#888"))
+                self.root.after(0, lambda: self._is_current_preview(token) and (
+                    self._img_gen.delete("all") or
+                    self._img_gen.create_text(90, 90, text="[待生成]", fill="#888")))
         except Exception:
-            self.root.after(0, lambda: self._img_orig.delete("all") or
-                self._img_orig.create_text(90, 90, text="[加载失败]", fill="#888"))
+            self.root.after(0, lambda: self._is_current_preview(token) and (
+                self._img_orig.delete("all") or
+                self._img_orig.create_text(90, 90, text="[加载失败]", fill="#888")))
 
-    def _load_test_ref_image(self, img_url):
+    def _load_test_ref_image(self, img_url, token):
         """Pre-load reference image for the test panel."""
         try:
             from api_client import download_image
             img_data = download_image(img_url)
-            self.root.after(0, lambda: self._canvas_show_image(
+            self.root.after(0, lambda: self._is_current_preview(token) and self._canvas_show_image(
                 self._img_ref, img_data, "test_ref"))
         except Exception:
-            self.root.after(0, lambda: self._img_ref.delete("all") or
-                self._img_ref.create_text(90, 90, text="[加载失败]", fill="#888"))
+            self.root.after(0, lambda: self._is_current_preview(token) and (
+                self._img_ref.delete("all") or
+                self._img_ref.create_text(90, 90, text="[加载失败]", fill="#888")))
 
     # ============================================================
     # WAVE 5 — task-10: Test Panel (built alongside for convenience)
@@ -752,10 +782,9 @@ class UploaderApp:
         if not (0 <= idx < len(self.products)):
             return
         prod = self.products[idx]
-        # Collect up to 4 reference images: main + up to 3 extra images
-        refs = [prod.main_img] + prod.extra_imgs[:3]
-        refs = list(dict.fromkeys(refs))  # dedup, keep order
-        refs = [u for u in refs if u and u.startswith("http")]
+        from processor import build_generation_prompt, collect_generation_refs
+        refs = collect_generation_refs(prod)
+        prompt = build_generation_prompt(prompt)
 
         self._test_status.configure(text="生图中...", foreground="#f39c12")
         self._img_result.delete("all")
@@ -813,8 +842,8 @@ class UploaderApp:
         fields = [
             ("DeepSeek Key (必填):", "deepseek_key", cfg.get("deepseek_key", ""), False),
             ("DeepSeek URL:", "deepseek_url", cfg.get("deepseek_url", ""), False),
-            ("haomingai Key:", "haomingai_key", cfg.get("haomingai_key", ""), False),
-            ("haomingai URL:", "haomingai_url", cfg.get("haomingai_url", ""), False),
+            ("routeapi Key:", "routeapi_key", cfg.get("routeapi_key", ""), False),
+            ("routeapi URL:", "routeapi_url", cfg.get("routeapi_url", ""), False),
             ("hfsyapi Key:", "hfsyapi_key", cfg.get("hfsyapi_key", ""), False),
             ("hfsyapi URL:", "hfsyapi_url", cfg.get("hfsyapi_url", ""), False),
             ("Cloudinary Cloud Name:", "cloud_name", storage.get("cloud_name", ""), False),
@@ -1040,7 +1069,7 @@ class UploaderApp:
 
 ## 第一步：配置 API
 点击菜单 设置 → API 配置。必填项：DeepSeek Key。
-haomingai Key 和 Cloudinary 选填（不填则跳过对应功能）。
+routeapi Key 和 Cloudinary 配置用于生图和图片上传。
 代理地址留空则自动检测系统代理。
 
 ## 第二步：选择文件
@@ -1217,17 +1246,39 @@ ParentSKU 并跳过，只处理剩余的。
         platform = self._platform_var.get()
         for p in self.products:
             p.platform = platform
-            orig = self._orig_main_img.get(p.parent_sku, "")
             if platform == "aliexpress" and p.variant_imgs:
-                p.main_img = p.variant_imgs[0]
+                p.main_img = self._get_aliexpress_main_img(p)
             else:
-                p.main_img = orig
+                p.main_img = self._get_shein_main_img(p)
+
+    def _get_shein_main_img(self, prod):
+        orig_map = getattr(self, "_orig_main_img", {})
+        orig = orig_map.get(prod.parent_sku, "")
+        if orig:
+            return orig
+        if prod.extra_imgs:
+            return prod.extra_imgs[0]
+        return prod.main_img
+
+    def _get_aliexpress_main_img(self, prod):
+        if prod.variant_imgs:
+            return prod.variant_imgs[0]
+        return self._get_shein_main_img(prod)
 
     def _on_platform_changed(self, event=None):
         if not self.products:
             return
+        selected_idx = None
+        sel = self._tree.selection()
+        if sel:
+            selected_idx = int(self._tree.index(sel[0]))
         self._apply_platform_images()
         self._refresh_list()
+        if selected_idx is not None and 0 <= selected_idx < len(self.products):
+            item_id = str(selected_idx)
+            if item_id in self._tree.get_children():
+                self._tree.selection_set(item_id)
+            self._show_preview(self.products[selected_idx])
 
     def _refresh_list(self):
         """Rebuild Treeview from self.products."""
@@ -1544,7 +1595,7 @@ ParentSKU 并跳过，只处理剩余的。
 
         def stat_cb(ds, hm, up):
             self._stats["deepseek"] = ds
-            self._stats["haomingai"] = hm
+            self._stats["image"] = hm
             self._stats["upload"] = up
             self.root.after(0, lambda: self._stat_label.configure(
                 text=f"DeepSeek: {ds} | 生图: {hm} | 上传: {up}"))
@@ -1672,7 +1723,7 @@ ParentSKU 并跳过，只处理剩余的。
             self._prog["value"] = 0
             self._prog_label.configure(text="0/0")
             self._stat_label.configure(text="DeepSeek: 0 | 生图: 0 | 上传: 0")
-            self._stats = {"deepseek": 0, "haomingai": 0, "upload": 0}
+            self._stats = {"deepseek": 0, "image": 0, "upload": 0}
 
     def _retry_all_failed(self):
         if hasattr(self, '_pipeline') and self._pipeline.errors:

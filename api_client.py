@@ -4,13 +4,13 @@
 
 Manages all outbound HTTP calls:
   - DeepSeek (chat + translate)
-  - haomingai (image generation + product identification)
+  - routeapi (image generation)
   - Image download (via proxy)
   - Storage upload (Cloudinary, extensible via StorageProvider ABC)
 
 Proxy rules (per task-03 spec):
   - DeepSeek ............ DIRECT (no proxy)
-  - haomingai ........... USE proxy
+  - routeapi ............ USE proxy
   - download_image ...... USE proxy
   - storage upload ...... USE proxy
 """
@@ -20,6 +20,7 @@ import time
 import hashlib
 import base64
 import io
+import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 
@@ -53,6 +54,28 @@ def _make_opener(use_proxy):
         "https": proxy_url,
     })
     return urllib.request.build_opener(proxy_handler)
+
+
+def _format_http_error(label, err, channel=None):
+    """Return a compact API error message that includes the response body."""
+    body = ""
+    try:
+        raw = err.read()
+        if raw:
+            body = raw.decode("utf-8", errors="replace")
+    except Exception:
+        body = ""
+    finally:
+        try:
+            err.close()
+        except Exception:
+            pass
+    body = " ".join(body.split())
+    if len(body) > 500:
+        body = body[:500] + "..."
+    via = f" via {channel}" if channel else ""
+    detail = body or getattr(err, "reason", "") or str(err)
+    return RuntimeError(f"{label} HTTP {err.code}{via}: {detail}")
 
 
 # ============================================================
@@ -144,20 +167,22 @@ def deepseek_translate(text, target="ko"):
 
 
 # ============================================================
-# 3. haomingai — image generation
+# 3. routeapi image generation
 # ============================================================
 
-def haomingai_generate(prompt, img_urls, model="gpt-image-2-Low"):
-    """Call haomingai image-edits API to generate a product photo.
+def routeapi_generate(prompt, img_urls=None, model="gpt-image-2-1k", size="1024x1024"):
+    """Call 1route image-edits API to generate a product photo.
 
     Parameters
     ----------
     prompt : str
         Generation prompt describing the desired output.
-    img_urls : str | list[str]
+    img_urls : str | list[str] | None
         One or more reference image URLs (max 10 used).
     model : str
-        Model name (default ``"gpt-image-2-Low"``).
+        Model name (default ``"gpt-image-2-1k"``).
+    size : str
+        Output size (default ``"1024x1024"``).
 
     Returns
     -------
@@ -171,13 +196,14 @@ def haomingai_generate(prompt, img_urls, model="gpt-image-2-Low"):
     """
     if isinstance(img_urls, str):
         img_urls = [img_urls]
+    elif img_urls is None:
+        img_urls = []
 
     cfg = _get_config()
-    url = cfg.get("haomingai_url", "https://api.haomingai.com/v1/images/edits")
-    api_key = cfg.get("haomingai_key", "")
+    url = cfg.get("routeapi_url", "https://api.1route.dev/v1/images/edits")
+    api_key = cfg.get("routeapi_key", "")
 
     boundary = "----FormBoundary7MA4YWxkTrZu0gW"
-    opener = _make_opener(use_proxy=True)  # USE proxy
 
     last_err = None
     for attempt in range(4):  # initial + 3 retries
@@ -187,7 +213,7 @@ def haomingai_generate(prompt, img_urls, model="gpt-image-2-Low"):
             for field, val in [
                 ("model", model),
                 ("prompt", prompt),
-                ("size", "1024x1024"),
+                ("size", size),
                 ("response_format", "b64_json"),
             ]:
                 body += (
@@ -196,25 +222,41 @@ def haomingai_generate(prompt, img_urls, model="gpt-image-2-Low"):
                     f"\r\n{val}\r\n"
                 ).encode()
 
-            # Attach reference images
+            # Attach reference images. Some source CDNs reject hotlink downloads;
+            # skip bad auxiliary refs instead of failing the whole generation.
+            attached = 0
+            skipped = []
             for i, img_url in enumerate(img_urls[:10]):
-                img_data = download_image(img_url)
-                fname = f"ref{i}.jpg"
+                try:
+                    img_data = download_image(img_url)
+                except Exception as e:
+                    skipped.append((img_url, str(e)))
+                    continue
+                fname = f"ref{attached}.jpg"
                 body += (
                     f"--{boundary}\r\n"
                     f'Content-Disposition: form-data; name="image"; filename="{fname}"\r\n'
                     f"Content-Type: image/jpeg\r\n\r\n"
                 ).encode()
                 body += img_data + b"\r\n"
+                attached += 1
+            if attached == 0:
+                detail = "; ".join([f"{u}: {err}" for u, err in skipped[:3]])
+                raise ValueError(f"no reference images could be downloaded: {detail}")
             body += f"--{boundary}--\r\n".encode()
 
             headers = {
                 "Content-Type": f"multipart/form-data; boundary={boundary}",
                 "Authorization": f"Bearer {api_key}",
+                "User-Agent": "Mozilla/5.0",
             }
             req = urllib.request.Request(url, data=body, headers=headers)
-            with opener.open(req, timeout=180) as r:
-                resp = json.loads(r.read())
+            opener = _make_opener(use_proxy=True)
+            try:
+                with opener.open(req, timeout=180) as r:
+                    resp = json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                raise _format_http_error("routeapi", e, "proxy")
 
             b64 = resp["data"][0].get("b64_json", "")
             if b64:
@@ -223,7 +265,7 @@ def haomingai_generate(prompt, img_urls, model="gpt-image-2-Low"):
             url_result = resp["data"][0].get("url", "")
             if url_result:
                 return download_image(url_result)
-            raise ValueError("haomingai response missing both b64_json and url")
+            raise ValueError("routeapi response missing both b64_json and url")
 
         except Exception as e:
             last_err = e
@@ -233,105 +275,14 @@ def haomingai_generate(prompt, img_urls, model="gpt-image-2-Low"):
 
 
 # ============================================================
-# 4. haomingai — product identification
-# ============================================================
-
-def haomingai_identify(image_url):
-    """Identify a product category from an image via haomingai.
-
-    Uses the same image-edits endpoint with an identification prompt.
-    Retries 2 times (total 3 attempts) per the spec.
-
-    Parameters
-    ----------
-    image_url : str
-        URL of the product image to analyse.
-
-    Returns
-    -------
-    str
-        Category keyword text.
-
-    Raises
-    ------
-    Exception
-        After 2 retries the last error is re-raised.
-    """
-    if isinstance(image_url, str):
-        image_urls = [image_url]
-    else:
-        image_urls = image_url
-
-    cfg = _get_config()
-    url = cfg.get("haomingai_url", "https://api.haomingai.com/v1/images/edits")
-    api_key = cfg.get("haomingai_key", "")
-
-    prompt = "识别图片中的产品品类，只输出品类关键词，不要解释"
-    boundary = "----FormBoundary7MA4YWxkTrZu0gW"
-    opener = _make_opener(use_proxy=True)  # USE proxy
-
-    last_err = None
-    for attempt in range(3):  # initial + 2 retries
-        try:
-            body = b""
-            for field, val in [
-                ("model", "gpt-image-2-Low"),
-                ("prompt", prompt),
-                ("size", "1024x1024"),
-                ("response_format", "b64_json"),
-            ]:
-                body += (
-                    f"--{boundary}\r\n"
-                    f'Content-Disposition: form-data; name="{field}"\r\n'
-                    f"\r\n{val}\r\n"
-                ).encode()
-
-            for i, img_url in enumerate(image_urls[:10]):
-                img_data = download_image(img_url)
-                fname = f"ref{i}.jpg"
-                body += (
-                    f"--{boundary}\r\n"
-                    f'Content-Disposition: form-data; name="image"; filename="{fname}"\r\n'
-                    f"Content-Type: image/jpeg\r\n\r\n"
-                ).encode()
-                body += img_data + b"\r\n"
-            body += f"--{boundary}--\r\n".encode()
-
-            headers = {
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "Authorization": f"Bearer {api_key}",
-            }
-            req = urllib.request.Request(url, data=body, headers=headers)
-            with opener.open(req, timeout=180) as r:
-                resp = json.loads(r.read())
-
-            b64 = resp["data"][0].get("b64_json", "")
-            if b64:
-                decoded = base64.b64decode(b64)
-                try:
-                    return decoded.decode("utf-8").strip()
-                except UnicodeDecodeError:
-                    return ""
-            # Fallback: text in url or other field
-            text_result = resp["data"][0].get("url", "")
-            return text_result.strip()
-
-        except Exception as e:
-            last_err = e
-            if attempt < 2:
-                time.sleep(1)
-    raise last_err
-
-
-# ============================================================
-# 4b. hfsyapi image generation (JSON-based, reference_images)
+# 4. hfsyapi image generation (JSON-based, reference_images)
 # ============================================================
 
 def hfsyapi_generate(prompt, img_urls=None, model="gpt-image-2",
                      size="1024x1024", response_format="b64_json"):
     """Generate image via hfsyapi.cn — JSON-based, supports reference_images.
 
-    Unlike haomingai (multipart), this API accepts a plain JSON body with
+    Unlike routeapi (multipart), this API accepts a plain JSON body with
     ``reference_images`` as an array of ``data:`` URLs (base64).  We download
     each reference image ourselves (through proxy) and embed it as base64 so
     the hfsyapi server never needs to reach the original hosts.
@@ -371,7 +322,7 @@ def hfsyapi_generate(prompt, img_urls=None, model="gpt-image-2",
     # Download reference images ourselves and embed as data URLs.
     # hfsyapi cannot reach Shein/1688 hosts, but we can through proxy.
     data_refs = []
-    for u in (img_urls or [])[:4]:
+    for u in (img_urls or [])[:6]:
         try:
             img_bytes = download_image(u)
             b64 = base64.b64encode(img_bytes).decode()
@@ -444,7 +395,7 @@ def generate_image(prompt, img_urls=None, api_choice=None,
     img_urls : str or list[str] or None
         Reference image URLs.
     api_choice : str or None
-        ``"haomingai"`` or ``"hfsyapi"``.  Defaults to ``config.image_api``.
+        ``"routeapi"`` or ``"hfsyapi"``.  Defaults to ``config.image_api``.
     model : str or None
         Model override (uses each API's default when None).
     size : str
@@ -456,14 +407,14 @@ def generate_image(prompt, img_urls=None, api_choice=None,
         Decoded image bytes.
     """
     if api_choice is None:
-        api_choice = _get_config().get("image_api", "haomingai")
+        api_choice = _get_config().get("image_api", "routeapi")
 
     if api_choice == "hfsyapi":
         m = model or "gpt-image-2"
         return hfsyapi_generate(prompt, img_urls, model=m, size=size)
     else:
-        m = model or "gpt-image-2-Low"
-        return haomingai_generate(prompt, img_urls, model=m)
+        m = model or "gpt-image-2-1k"
+        return routeapi_generate(prompt, img_urls, model=m, size=size)
 
 
 # ============================================================
