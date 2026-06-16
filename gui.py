@@ -34,7 +34,8 @@ class UploaderApp:
 
     def __init__(self, startup_warnings=None, restore_state=None):
         self.warnings = startup_warnings or []
-        self.root = tb.Window(themename="cosmo")
+        cfg = load_config()
+        self.root = tb.Window(themename=cfg.get("theme", "cosmo"))
         self.root.title("耀我科技上传器 v2.0")
         self.root.geometry("1100x700")
         self._setup_menu()
@@ -113,6 +114,7 @@ class UploaderApp:
     def _setup_toolbar(self):
         tbar = tb.Frame(self.root, padding=4)
         tbar.pack(fill=tk.X)
+        cfg = load_config()
         tb.Label(tbar, text="采集表:").pack(side=tk.LEFT, padx=2)
         self._src_btn = tb.Button(tbar, text="无", width=20, command=self._select_source,
                                   bootstyle="outline-secondary")
@@ -123,19 +125,30 @@ class UploaderApp:
         self._tpl_btn.pack(side=tk.LEFT, padx=2)
         tb.Separator(tbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         tb.Label(tbar, text="标题:").pack(side=tk.LEFT, padx=2)
-        self._title_profile_var = tk.StringVar(value="title")
+        all_profiles = list(load_prompts().keys())
+        title_profile = cfg.get("title_profile", "title")
+        if title_profile not in all_profiles:
+            title_profile = "title"
+        self._title_profile_var = tk.StringVar(value=title_profile)
         self._title_profile_cb = tb.Combobox(tbar, textvariable=self._title_profile_var,
                                               values=["title"], state="readonly", width=10)
         self._title_profile_cb.pack(side=tk.LEFT, padx=2)
+        self._title_profile_cb.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self._on_toolbar_setting_changed("title_profile"))
         tb.Label(tbar, text="生图:").pack(side=tk.LEFT, padx=(8, 2))
-        all_profiles = list(load_prompts().keys())
         img_profiles = [k for k in all_profiles if k != "title"] or ["generic"]
-        self._img_profile_var = tk.StringVar(value=img_profiles[0])
+        img_profile = cfg.get("image_prompt", cfg.get("img_profile", img_profiles[0]))
+        if img_profile not in img_profiles:
+            img_profile = img_profiles[0]
+        self._img_profile_var = tk.StringVar(value=img_profile)
         self._img_profile_cb = tb.Combobox(tbar, textvariable=self._img_profile_var,
                                             values=img_profiles, state="readonly", width=14)
         self._img_profile_cb.pack(side=tk.LEFT, padx=2)
+        self._img_profile_cb.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self._on_toolbar_setting_changed("image_prompt"))
         # Image API selector
-        cfg = load_config()
         current_api = cfg.get("image_api", "routeapi")
         if current_api not in ("routeapi", "hfsyapi"):
             current_api = "routeapi"
@@ -147,7 +160,10 @@ class UploaderApp:
         self._img_api_cb.bind("<<ComboboxSelected>>", self._on_img_api_changed)
         # Platform selector for collector table format
         tb.Label(tbar, text="  平台:").pack(side=tk.LEFT, padx=(8,2))
-        self._platform_var = tk.StringVar(value="shein")
+        current_platform = cfg.get("platform", "shein")
+        if current_platform not in ("shein", "aliexpress"):
+            current_platform = "shein"
+        self._platform_var = tk.StringVar(value=current_platform)
         self._platform_cb = tb.Combobox(tbar, textvariable=self._platform_var,
                                           values=["shein", "aliexpress"],
                                           state="readonly", width=10)
@@ -217,6 +233,9 @@ class UploaderApp:
             self._img_profile_var.set(img_p)
         if title_p in self._title_profile_cb["values"]:
             self._title_profile_var.set(title_p)
+        platform = state.get("platform")
+        if platform in ("shein", "aliexpress"):
+            self._platform_var.set(platform)
         # Restore stats
         saved_stats = state.get("stats", {})
         self._stats = {
@@ -827,9 +846,23 @@ class UploaderApp:
         cfg["image_api"] = self._img_api_var.get()
         save_config(cfg)
 
+    def _on_toolbar_setting_changed(self, key, event=None):
+        """Save toolbar dropdown choices that should persist across restarts."""
+        vars_by_key = {
+            "title_profile": "_title_profile_var",
+            "image_prompt": "_img_profile_var",
+            "platform": "_platform_var",
+        }
+        cfg = load_config()
+        cfg[key] = getattr(self, vars_by_key[key]).get()
+        save_config(cfg)
+
     def _set_theme(self, name):
         """Switch ttkbootstrap theme."""
         self.root.style.theme_use(name)
+        cfg = load_config()
+        cfg["theme"] = name
+        save_config(cfg)
 
     def _open_api_settings(self):
         """API key configuration dialog."""
@@ -1266,6 +1299,7 @@ ParentSKU 并跳过，只处理剩余的。
         return self._get_shein_main_img(prod)
 
     def _on_platform_changed(self, event=None):
+        self._on_toolbar_setting_changed("platform")
         if not self.products:
             return
         selected_idx = None
@@ -1503,6 +1537,7 @@ ParentSKU 并跳过，只处理剩余的。
             "products": self.products,
             "img_profile": self._img_profile_var.get(),
             "title_profile": self._title_profile_var.get(),
+            "platform": self._platform_var.get(),
             "mode": self._mode_var.get(),
             "stats": self._stats,
         }

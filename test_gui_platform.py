@@ -1,5 +1,6 @@
 import unittest
 
+import gui
 from gui import UploaderApp
 from models import Product
 
@@ -29,7 +30,28 @@ class FakeTree:
         self.selected = item
 
 
+class FakeStyle:
+    def __init__(self):
+        self.theme = None
+
+    def theme_use(self, name):
+        self.theme = name
+
+
+class FakeRoot:
+    def __init__(self):
+        self.style = FakeStyle()
+
+
 class PlatformSwitchTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_load_config = gui.load_config
+        self._orig_save_config = gui.save_config
+
+    def tearDown(self):
+        gui.load_config = self._orig_load_config
+        gui.save_config = self._orig_save_config
+
     def test_platform_switch_refreshes_selected_preview(self):
         app = UploaderApp.__new__(UploaderApp)
         prod = Product(parent_sku="P1", main_img="main.jpg")
@@ -50,6 +72,41 @@ class PlatformSwitchTests(unittest.TestCase):
         self.assertEqual(prod.main_img, "variant-first.jpg")
         self.assertEqual(refreshed, [True])
         self.assertEqual(previews, ["variant-first.jpg"])
+
+    def test_platform_change_saves_config_even_without_products(self):
+        app = UploaderApp.__new__(UploaderApp)
+        app.products = []
+        app._platform_var = FakeVar("aliexpress")
+        saved = []
+        gui.load_config = lambda: {"image_api": "routeapi"}
+        gui.save_config = lambda cfg: saved.append(dict(cfg))
+
+        app._on_platform_changed()
+
+        self.assertEqual(saved, [{"image_api": "routeapi", "platform": "aliexpress"}])
+
+    def test_toolbar_setting_change_saves_config(self):
+        app = UploaderApp.__new__(UploaderApp)
+        app._img_profile_var = FakeVar("generic")
+        saved = []
+        gui.load_config = lambda: {"platform": "shein"}
+        gui.save_config = lambda cfg: saved.append(dict(cfg))
+
+        app._on_toolbar_setting_changed("image_prompt")
+
+        self.assertEqual(saved, [{"platform": "shein", "image_prompt": "generic"}])
+
+    def test_theme_change_saves_config(self):
+        app = UploaderApp.__new__(UploaderApp)
+        app.root = FakeRoot()
+        saved = []
+        gui.load_config = lambda: {"platform": "shein"}
+        gui.save_config = lambda cfg: saved.append(dict(cfg))
+
+        app._set_theme("darkly")
+
+        self.assertEqual(app.root.style.theme, "darkly")
+        self.assertEqual(saved, [{"platform": "shein", "theme": "darkly"}])
 
     def test_main_image_source_text_reports_platform_rule(self):
         app = UploaderApp.__new__(UploaderApp)
