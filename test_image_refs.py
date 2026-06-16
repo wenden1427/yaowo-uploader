@@ -57,12 +57,17 @@ class ImageReferenceTests(unittest.TestCase):
             ],
         )
 
-    def test_generation_prompt_marks_first_reference_as_base(self):
+    def test_generation_prompt_uses_first_reference_as_product_baseline_only(self):
         prompt = build_generation_prompt("Make a clean product photo")
 
-        self.assertIn("第一张参考图", prompt)
-        self.assertIn("基底图", prompt)
+        self.assertIn("第一张参考图作为产品主体基准", prompt)
+        self.assertIn("保持第一张图中的产品颜色、型号、款式和关键识别特征一致", prompt)
+        self.assertIn("不要照搬第一张图的原始构图、背景、光线和拍摄角度", prompt)
+        self.assertIn("可以根据用户提示重新设计背景、光线、构图、角度、质感和商业场景", prompt)
         self.assertIn("后续参考图", prompt)
+        self.assertNotIn("基底图", prompt)
+        self.assertNotIn("必须以", prompt)
+        self.assertNotIn("为准", prompt)
         self.assertTrue(prompt.endswith("Make a clean product photo"))
 
 
