@@ -11,7 +11,7 @@ from openpyxl import load_workbook
 from models import Product, Batch, ProductStatus
 from config_manager import load_config, load_prompts, load_categories, load_banned_words
 from config_manager import load_category_zh, save_category_zh
-from api_client import deepseek_chat, generate_image, haomingai_identify, download_image
+from api_client import deepseek_chat, generate_image, download_image
 from api_client import create_storage_provider
 
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -592,13 +592,46 @@ def _ensure_image_meets_spec(image_bytes):
 
 # ---- Phase 2: Concurrent per-batch ----
 
+BASE_REFERENCE_PROMPT = (
+    "参考图规则：第一张参考图是基底图，必须以第一张参考图中的产品颜色、型号、"
+    "形状和主体结构为准。后续参考图只作为材质、细节、角度和场景辅助，"
+    "不要混入后续参考图中的其它颜色、型号或款式。"
+)
+
+
+def _dedupe_http_urls(urls, limit=6):
+    refs = []
+    for url in urls:
+        if not url or not isinstance(url, str) or not url.startswith("http"):
+            continue
+        if url not in refs:
+            refs.append(url)
+        if len(refs) >= limit:
+            break
+    return refs
+
+
+def collect_generation_refs(prod, limit=6):
+    """Collect image-generation refs with first image as the base reference."""
+    if prod.platform == "aliexpress":
+        base = prod.variant_imgs[0] if prod.variant_imgs else prod.main_img
+    else:
+        base = prod.main_img
+    return _dedupe_http_urls([base] + list(prod.extra_imgs), limit=limit)
+
+
+def build_generation_prompt(prompt):
+    """Prefix prompt with reference-image priority guidance."""
+    prompt = (prompt or "").strip()
+    if BASE_REFERENCE_PROMPT in prompt:
+        return prompt
+    return f"{BASE_REFERENCE_PROMPT}\n\n{prompt}" if prompt else BASE_REFERENCE_PROMPT
+
+
 def _gen_main_image(prod, prompt, storage):
     """Generate main image. AliExpress: 1st variant image as reference. Shein: main+extra."""
-    if prod.platform == "aliexpress":
-        refs = prod.variant_imgs[:1] if prod.variant_imgs else [prod.main_img]
-    else:
-        refs = [prod.main_img] + prod.extra_imgs[:3]  # max 4 total
-    refs = list(dict.fromkeys(refs))  # dedup keep order
+    refs = collect_generation_refs(prod)
+    prompt = build_generation_prompt(prompt)
     last_err = None
     for attempt in range(3):  # initial + 2 retries
         try:
@@ -765,7 +798,7 @@ class ProcessingPipeline:
         start_row = len(done_skus)  # continue from last written row
 
         # Process in batches
-        ds_count = hm_count = up_count = 0
+        ds_count = image_count = up_count = 0
         for batch_start in range(0, len(pending), batch_size):
             self._pause_event.wait()
             if self._stopped:
@@ -791,16 +824,6 @@ class ProcessingPipeline:
 
                     prod.status = ProductStatus.PHASE1_CATEGORY
                     self.progress_cb(real_idx + 1, total, f"#{real_idx + 1} 类目匹配中...")
-                    if not prod.tag:
-                        try:
-                            keywords = haomingai_identify(prod.main_img)
-                            prod.tag = deepseek_chat(
-                                f"将以下品类关键词翻译为韩文关键词: {keywords}",
-                                max_tokens=100, temp=0.3)
-                            ds_count += 1
-                            hm_count += 1
-                        except:
-                            pass
                     cat_path, k, l, m = phase1_category(prod, categories, self.prompt_key)
                     ds_count += 1
                     prod.result["K"] = k       # ESM code (number) — what Gmarket expects
@@ -859,10 +882,10 @@ class ProcessingPipeline:
                 aa_results[idx] = _collect_variant_imgs(prod, storage)
                 self.progress_cb(idx + 1, total, f"#{idx + 1} 生成完成")
 
-                return 1, max(detail_count, 1)  # (hm_count, up_count)
+                return 1, max(detail_count, 1)  # (image_count, up_count)
 
             threads = []
-            thread_results = []  # collect (hm_count, up_count) from each worker
+            thread_results = []  # collect (image_count, up_count) from each worker
             for prod in batch:
                 def _runner(p=prod):
                     r = worker(p)
@@ -874,7 +897,7 @@ class ProcessingPipeline:
             for t in threads:
                 t.join()
             for r in thread_results:
-                hm_count += r[0]
+                image_count += r[0]
                 up_count += r[1]
 
             # Write batch
@@ -893,7 +916,7 @@ class ProcessingPipeline:
 
             twb.save(self.output_path)
             self.progress_cb(batch_end, total, f"批次 {batch_start//batch_size + 1} 保存完成")
-            self.stat_cb(ds_count, hm_count, up_count)
+            self.stat_cb(ds_count, image_count, up_count)
 
             # Error confirm mode
             batch_errors = [e for e in self.errors if batch_start <= e[0] < batch_end]
@@ -908,4 +931,4 @@ class ProcessingPipeline:
                     break
 
         twb.save(self.output_path)
-        return ds_count, hm_count, up_count
+        return ds_count, image_count, up_count
