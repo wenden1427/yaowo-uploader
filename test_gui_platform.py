@@ -1,4 +1,5 @@
 import unittest
+import inspect
 
 import gui
 from gui import UploaderApp
@@ -107,6 +108,22 @@ class PlatformSwitchTests(unittest.TestCase):
 
         self.assertEqual(app.root.style.theme, "darkly")
         self.assertEqual(saved, [{"platform": "shein", "theme": "darkly"}])
+
+    def test_regenerate_checked_passes_storage_to_variant_uploads(self):
+        source = inspect.getsource(UploaderApp._do_batch_regen)
+
+        self.assertIn("_collect_variant_imgs(prod, storage)", source)
+
+    def test_api_settings_only_exposes_tencent_cos_secrets(self):
+        source = inspect.getsource(UploaderApp._open_api_settings)
+
+        self.assertIn("Tencent COS SecretId", source)
+        self.assertIn("Tencent COS SecretKey", source)
+        self.assertNotIn("Tencent COS Bucket", source)
+        self.assertNotIn("Tencent COS Region", source)
+        self.assertNotIn("Tencent COS Prefix", source)
+        self.assertNotIn("Tencent COS Base URL", source)
+        self.assertIn('"tencent_cos"', source)
 
     def test_main_image_source_text_reports_platform_rule(self):
         app = UploaderApp.__new__(UploaderApp)

@@ -529,7 +529,7 @@ class UploaderApp:
         try:
             from api_client import generate_image, create_storage_provider
             from config_manager import load_config, load_prompts
-            from processor import build_generation_prompt, collect_generation_refs
+            from processor import build_generation_prompt, collect_generation_refs, _ensure_image_meets_spec
 
             cfg = load_config()
             prompts = load_prompts()
@@ -541,6 +541,7 @@ class UploaderApp:
             prompt_text = build_generation_prompt(prompt_text)
 
             img_bytes = generate_image(prompt_text, refs)
+            img_bytes = _ensure_image_meets_spec(img_bytes)
 
             new_url = storage.upload(img_bytes, f"main_{prod.parent_sku}_regen.jpg")
             prod.result["Z"] = new_url
@@ -813,9 +814,11 @@ class UploaderApp:
     def _do_test_image(self, prompt, ref_urls):
         try:
             from api_client import generate_image, create_storage_provider
+            from processor import _ensure_image_meets_spec
 
             cfg = load_config()
             img_result = generate_image(prompt, ref_urls)
+            img_result = _ensure_image_meets_spec(img_result)
 
             storage = create_storage_provider(cfg)
             result_url = storage.upload(img_result, "test_output.jpg")
@@ -868,7 +871,7 @@ class UploaderApp:
         """API key configuration dialog."""
         dlg = tk.Toplevel(self.root)
         dlg.title("API 配置")
-        dlg.geometry("450x460")
+        dlg.geometry("500x520")
         dlg.transient(self.root)
         cfg = load_config()
         storage = cfg.get("storage", {})
@@ -879,6 +882,8 @@ class UploaderApp:
             ("routeapi URL:", "routeapi_url", cfg.get("routeapi_url", ""), False),
             ("hfsyapi Key:", "hfsyapi_key", cfg.get("hfsyapi_key", ""), False),
             ("hfsyapi URL:", "hfsyapi_url", cfg.get("hfsyapi_url", ""), False),
+            ("Tencent COS SecretId:", "secret_id", storage.get("secret_id", ""), True),
+            ("Tencent COS SecretKey:", "secret_key", storage.get("secret_key", ""), True),
             ("Cloudinary Cloud Name:", "cloud_name", storage.get("cloud_name", ""), False),
             ("Cloudinary API Key:", "api_key", storage.get("api_key", ""), True),
             ("Cloudinary API Secret:", "api_secret", storage.get("api_secret", ""), True),
@@ -894,13 +899,15 @@ class UploaderApp:
             entries[key] = e
 
         def save():
+            storage_keys = {
+                "secret_id", "secret_key", "cloud_name", "api_key", "api_secret",
+            }
             for key, e in entries.items():
                 v = e.get().strip()
-                if key in ("cloud_name", "api_key", "api_secret"):
+                if key in storage_keys:
                     # Save to storage sub-dict
                     if v:
                         cfg.setdefault("storage", {})[key] = v
-                        cfg["storage"]["provider"] = "cloudinary"
                     else:
                         cfg.setdefault("storage", {}).pop(key, None)
                 else:
@@ -908,6 +915,15 @@ class UploaderApp:
                         cfg[key] = v
                     elif key in cfg:
                         del cfg[key]
+            storage = cfg.setdefault("storage", {})
+            if all(storage.get(k) for k in ("secret_id", "secret_key")):
+                storage["provider"] = "tencent_cos"
+                storage["bucket"] = "yaowoo-1443995558"
+                storage["region"] = "ap-hongkong"
+                storage["prefix"] = "gmarket/uploads"
+                storage["base_url"] = "https://yaowoo-1443995558.cos.ap-hongkong.myqcloud.com"
+            elif all(storage.get(k) for k in ("cloud_name", "api_key", "api_secret")):
+                storage["provider"] = "cloudinary"
             save_config(cfg)
             dlg.destroy()
             messagebox.showinfo("提示", "API 配置已保存")
@@ -1467,7 +1483,7 @@ ParentSKU 并跳过，只处理剩余的。
                 prod.result["AB"] = _gen_detail_html(prod, self.products, storage)
 
                 prod.status = ProductStatus.PHASE2_VARIANT
-                prod.result["AA"] = _collect_variant_imgs(prod)
+                prod.result["AA"] = _collect_variant_imgs(prod, storage)
 
                 prod.status = ProductStatus.DONE
                 prod.logs.append(f"{time.strftime('%H:%M:%S')} [重处理] 全部完成")

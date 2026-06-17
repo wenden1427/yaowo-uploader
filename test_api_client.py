@@ -7,7 +7,16 @@ import urllib.error
 import api_client
 
 
+def make_jpeg(width=640, height=640):
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), (240, 240, 240)).save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
 class FakeResponse:
+    status = 200
+
     def __enter__(self):
         return self
 
@@ -42,6 +51,28 @@ class FailingOpener:
             hdrs=None,
             fp=io.BytesIO(self.body),
         )
+
+
+class EmptyResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return b""
+
+
+class RecordingOpener:
+    def __init__(self):
+        self.requests = []
+
+    def open(self, req, timeout=None):
+        self.requests.append((req, timeout))
+        return EmptyResponse()
 
 
 class RouteApiTests(unittest.TestCase):
@@ -147,6 +178,74 @@ class RouteApiTests(unittest.TestCase):
         legacy_prefix = "hao" + "ming" + "ai"
         self.assertFalse(hasattr(api_client, f"{legacy_prefix}_generate"))
         self.assertFalse(hasattr(api_client, f"{legacy_prefix}_identify"))
+
+
+class StorageProviderTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_make_opener = api_client._make_opener
+
+    def tearDown(self):
+        api_client._make_opener = self._orig_make_opener
+
+    def test_create_storage_provider_supports_tencent_cos(self):
+        provider = api_client.create_storage_provider({
+            "storage": {
+                "provider": "tencent_cos",
+                "secret_id": "sid",
+                "secret_key": "skey",
+                "bucket": "yaowoo-1443995558",
+                "region": "ap-hongkong",
+                "prefix": "gmarket/test",
+            }
+        })
+
+        self.assertIsInstance(provider, api_client.TencentCOSProvider)
+
+    def test_create_storage_provider_uses_tencent_cos_defaults(self):
+        provider = api_client.create_storage_provider({
+            "storage": {
+                "provider": "tencent_cos",
+                "secret_id": "sid",
+                "secret_key": "skey",
+            }
+        })
+
+        self.assertEqual(provider.bucket, "yaowoo-1443995558")
+        self.assertEqual(provider.region, "ap-hongkong")
+        self.assertEqual(provider.prefix, "gmarket/uploads")
+        self.assertEqual(
+            provider.base_url,
+            "https://yaowoo-1443995558.cos.ap-hongkong.myqcloud.com",
+        )
+
+    def test_tencent_cos_upload_puts_jpeg_and_returns_public_url(self):
+        opener = RecordingOpener()
+        proxy_flags = []
+        api_client._make_opener = lambda use_proxy: (proxy_flags.append(use_proxy) or opener)
+        provider = api_client.TencentCOSProvider(
+            secret_id="sid",
+            secret_key="skey",
+            bucket="yaowoo-1443995558",
+            region="ap-hongkong",
+            prefix="gmarket/test",
+        )
+
+        result = provider.upload(make_jpeg(), "main P1.png")
+
+        self.assertTrue(result.startswith(
+            "https://yaowoo-1443995558.cos.ap-hongkong.myqcloud.com/gmarket/test/"
+        ))
+        self.assertTrue(result.endswith(".jpg"))
+        self.assertEqual(proxy_flags, [True])
+        self.assertEqual(len(opener.requests), 1)
+        req, timeout = opener.requests[0]
+        self.assertEqual(req.get_method(), "PUT")
+        self.assertEqual(timeout, 60)
+        self.assertLessEqual(len(req.data), 300_000)
+        self.assertEqual(req.headers["Content-type"], "image/jpeg")
+        self.assertIn("q-sign-algorithm=sha1", req.headers["Authorization"])
+        self.assertIn("Host", req.headers)
+        self.assertIn("yaowoo-1443995558.cos.ap-hongkong.myqcloud.com", req.full_url)
 
 
 if __name__ == "__main__":
