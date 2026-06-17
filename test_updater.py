@@ -19,9 +19,9 @@ class UpdaterVersionTests(unittest.TestCase):
         elif hasattr(updater, "open"):
             delattr(updater, "open")
 
-    def test_local_version_prefers_git_head_over_version_file(self):
+    def test_local_version_prefers_version_file_over_git_head(self):
         git_sha = "a" * 40
-        version_file_sha = "b" * 40
+        version_marker = "2026.06.17-cos.3"
 
         updater.os.path.exists = lambda path: True
 
@@ -39,9 +39,22 @@ class UpdaterVersionTests(unittest.TestCase):
                 return False
 
             def read(self):
-                return version_file_sha
+                return version_marker
 
         updater.open = lambda *args, **kwargs: FakeFile()
+
+        self.assertEqual(updater._get_local_version(), version_marker)
+
+    def test_local_version_falls_back_to_git_head_when_version_file_missing(self):
+        git_sha = "a" * 40
+
+        updater.os.path.exists = lambda path: False
+
+        class Result:
+            returncode = 0
+            stdout = git_sha + "\n"
+
+        updater.subprocess.run = lambda *args, **kwargs: Result()
 
         self.assertEqual(updater._get_local_version(), git_sha)
 
