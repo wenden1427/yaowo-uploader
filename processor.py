@@ -6,6 +6,7 @@ import os
 import re
 import time
 import threading
+import io
 from openpyxl import load_workbook
 
 from models import Product, Batch, ProductStatus
@@ -13,6 +14,7 @@ from config_manager import load_config, load_prompts, load_categories, load_bann
 from config_manager import load_category_zh, save_category_zh
 from api_client import deepseek_chat, generate_image, download_image
 from api_client import create_storage_provider
+from image_utils import ensure_marketplace_image_spec
 
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -551,43 +553,17 @@ def _ensure_min_dimensions(image_bytes):
     """Resize image so both width and height are >= 600px.
     Returns resized image bytes (JPEG format).
     """
-    from PIL import Image
-    img = Image.open(io.BytesIO(image_bytes))
-    w, h = img.size
-    if w >= 600 and h >= 600:
-        return image_bytes
-    # Scale up so the SMALLER dimension becomes 600
-    scale = max(600 / w, 600 / h)
-    new_w = max(int(w * scale), 600)
-    new_h = max(int(h * scale), 600)
-    img = img.resize((new_w, new_h), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=92, optimize=True)
-    return buf.getvalue()
+    return ensure_marketplace_image_spec(image_bytes)
 
 
 def _ensure_under_2mb(image_bytes):
-    """Compress image_bytes to under 2 MB using PIL."""
-    if len(image_bytes) <= 2_000_000:
-        return image_bytes
-    from PIL import Image
-    img = Image.open(io.BytesIO(image_bytes))
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=60, optimize=True)
-    compressed = buf.getvalue()
-    if len(compressed) > 2_000_000:
-        img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=50, optimize=True)
-        compressed = buf.getvalue()
-    return compressed
+    """Backward-compatible helper; now targets 300 KB."""
+    return ensure_marketplace_image_spec(image_bytes)
 
 
 def _ensure_image_meets_spec(image_bytes):
-    """Ensure image meets ESM specs: >= 600x600, <= 2MB."""
-    fixed = _ensure_min_dimensions(image_bytes)
-    fixed = _ensure_under_2mb(fixed)
-    return fixed
+    """Ensure image meets ESM specs: JPEG, >= 600x600, <= 300 KB."""
+    return ensure_marketplace_image_spec(image_bytes)
 
 
 # ---- Phase 2: Concurrent per-batch ----
@@ -638,6 +614,7 @@ def _gen_main_image(prod, prompt, storage):
     for attempt in range(3):  # initial + 2 retries
         try:
             img_bytes = generate_image(prompt, refs)
+            img_bytes = _ensure_image_meets_spec(img_bytes)
             url = storage.upload(img_bytes, f"main_{prod.parent_sku}.jpg")
             return url
         except Exception as e:
@@ -691,8 +668,8 @@ def _gen_detail_html(prod, all_products, storage):
                 safe = _ensure_image_meets_spec(buf.getvalue())
                 cloud_url = storage.upload(safe, f"detail_{int(time.time())}.jpg")
                 html_parts.append(f'<P><img src="{cloud_url}" width="800"></P>')
-            except Exception:
-                html_parts.append(f'<P><img src="{u}" width="800"></P>')
+            except Exception as e:
+                prod.logs.append(f"{time.strftime('%H:%M:%S')} 详情图跳过: {e}")
         return "\n".join(html_parts)
     except Exception as e:
         prod.logs.append(f"{time.strftime('%H:%M:%S')} 详情图失败: {e}")
@@ -719,8 +696,8 @@ def _collect_variant_imgs(prod, storage):
             safe = _ensure_image_meets_spec(img_data)
             cloud_url = storage.upload(safe, f"var_{int(time.time())}.jpg")
             safe_urls.append(cloud_url)
-        except Exception:
-            safe_urls.append(u)  # Keep original URL on failure
+        except Exception as e:
+            prod.logs.append(f"{time.strftime('%H:%M:%S')} 变种图跳过: {e}")
     return ",".join(safe_urls) if safe_urls else ""
 
 

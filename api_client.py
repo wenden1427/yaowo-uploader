@@ -18,11 +18,23 @@ Proxy rules (per task-03 spec):
 import json
 import time
 import hashlib
+import hmac
 import base64
 import io
+import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
+
+from image_utils import ensure_marketplace_image_spec
+
+DEFAULT_TENCENT_COS_BUCKET = "yaowoo-1443995558"
+DEFAULT_TENCENT_COS_REGION = "ap-hongkong"
+DEFAULT_TENCENT_COS_PREFIX = "gmarket/uploads"
+DEFAULT_TENCENT_COS_BASE_URL = (
+    "https://yaowoo-1443995558.cos.ap-hongkong.myqcloud.com"
+)
 
 # ============================================================
 # Internal helpers — config & proxy
@@ -505,8 +517,8 @@ class CloudinaryProvider(StorageProvider):
 
     def upload(self, image_bytes, filename="image.jpg"):
         """Upload to Cloudinary, returning the enhanced secure URL."""
-        # --- Compress if over 2 MB ---
-        data = self._ensure_under_2mb(image_bytes)
+        # --- Meet marketplace upload constraints before storing ---
+        data = self._ensure_upload_spec(image_bytes)
 
         # --- Build signed form body ---
         b64 = base64.b64encode(data).decode()
@@ -552,28 +564,137 @@ class CloudinaryProvider(StorageProvider):
         raise last_err
 
     @staticmethod
+    def _ensure_upload_spec(image_bytes):
+        """Ensure product images are JPEG, >=600x600 and under 300 KB."""
+        return ensure_marketplace_image_spec(image_bytes)
+
+    @staticmethod
+    def _ensure_min_dimensions(image_bytes):
+        """Resize image so both width and height are at least 600px."""
+        return ensure_marketplace_image_spec(image_bytes)
+
+    @staticmethod
     def _ensure_under_2mb(image_bytes):
-        """Compress image_bytes to under 2 MB using PIL if needed.
+        """Backward-compatible helper; now targets 300 KB."""
+        return ensure_marketplace_image_spec(image_bytes)
 
-        Returns the (possibly compressed) bytes.
-        """
-        if len(image_bytes) <= 2_000_000:
-            return image_bytes
 
-        from PIL import Image
-        img = Image.open(io.BytesIO(image_bytes))
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=60, optimize=True)
-        compressed = buf.getvalue()
+class TencentCOSProvider(StorageProvider):
+    """Tencent Cloud COS storage backend using XML API v5 signing.
 
-        if len(compressed) > 2_000_000:
-            # Still too big — shrink dimensions by half
-            img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=50, optimize=True)
-            compressed = buf.getvalue()
+    Config keys read from ``config["storage"]``:
 
-        return compressed
+    - secret_id
+    - secret_key
+    - bucket, for example ``yaowoo-1443995558``
+    - region, for example ``ap-hongkong``
+    - prefix, optional object prefix
+    - base_url, optional public base URL
+
+    Uploads are stored as JPEG objects and return public COS URLs.  The bucket
+    must be configured as public-read for marketplace crawlers to fetch them.
+    """
+
+    def __init__(self, secret_id, secret_key, bucket, region,
+                 prefix="gmarket/uploads", base_url=""):
+        self.secret_id = secret_id
+        self.secret_key = secret_key
+        self.bucket = bucket
+        self.region = region
+        self.prefix = str(prefix or "").strip("/")
+        self.host = f"{bucket}.cos.{region}.myqcloud.com"
+        self.base_url = (base_url or f"https://{self.host}").rstrip("/")
+
+    def upload(self, image_bytes, filename="image.jpg"):
+        """Upload to Tencent COS, returning the public JPEG URL."""
+        if not all([self.secret_id, self.secret_key, self.bucket, self.region]):
+            raise ValueError("Tencent COS storage requires secret_id, secret_key, bucket and region")
+
+        data = CloudinaryProvider._ensure_upload_spec(image_bytes)
+        key = self._build_object_key(data, filename)
+        target_url = f"https://{self.host}/{urllib.parse.quote(key, safe='/')}"
+        headers = {
+            "Host": self.host,
+            "Content-Type": "image/jpeg",
+            "Content-Length": str(len(data)),
+            "Authorization": self._authorization("PUT", key, "image/jpeg"),
+        }
+        opener = _make_opener(use_proxy=True)  # storage upload USE proxy
+
+        last_err = None
+        for attempt in range(4):
+            try:
+                req = urllib.request.Request(
+                    target_url, data=data, headers=headers, method="PUT"
+                )
+                with opener.open(req, timeout=60) as resp:
+                    resp.read()
+                    if getattr(resp, "status", 200) not in (200, 201):
+                        raise Exception(f"Tencent COS upload failed, status={getattr(resp, 'status', None)}")
+                return f"{self.base_url}/{urllib.parse.quote(key, safe='/')}"
+            except urllib.error.HTTPError as e:
+                last_err = _format_http_error("Tencent COS upload", e, "proxy")
+            except Exception as e:
+                last_err = e
+            if attempt < 3:
+                time.sleep(2)
+        raise last_err
+
+    def _build_object_key(self, image_bytes, filename):
+        safe_name = str(filename or "image.jpg").replace("\\", "/").split("/")[-1]
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", safe_name).strip("._-")
+        stem = safe_name.rsplit(".", 1)[0] if safe_name else "image"
+        if not stem:
+            stem = "image"
+        digest = hashlib.sha1(image_bytes).hexdigest()[:12]
+        stamp = int(time.time() * 1000)
+        object_name = f"{stamp}_{digest}_{stem}.jpg"
+        if self.prefix:
+            return f"{self.prefix}/{object_name}"
+        return object_name
+
+    def _authorization(self, method, key, content_type):
+        now = int(time.time())
+        key_time = f"{now};{now + 600}"
+        sign_key = hmac.new(
+            self.secret_key.encode("utf-8"),
+            key_time.encode("utf-8"),
+            hashlib.sha1,
+        ).hexdigest()
+        path = "/" + urllib.parse.quote(key, safe="/")
+        sign_headers = {
+            "content-type": content_type,
+            "host": self.host,
+        }
+        header_items = sorted(sign_headers.items())
+        header_list = ";".join(k for k, _ in header_items)
+        http_headers = "&".join(
+            f"{self._quote_sign(k)}={self._quote_sign(v)}"
+            for k, v in header_items
+        )
+        http_string = f"{method.lower()}\n{path}\n\n{http_headers}\n"
+        string_to_sign = "sha1\n{}\n{}\n".format(
+            key_time,
+            hashlib.sha1(http_string.encode("utf-8")).hexdigest(),
+        )
+        signature = hmac.new(
+            sign_key.encode("utf-8"),
+            string_to_sign.encode("utf-8"),
+            hashlib.sha1,
+        ).hexdigest()
+        return (
+            "q-sign-algorithm=sha1"
+            f"&q-ak={self.secret_id}"
+            f"&q-sign-time={key_time}"
+            f"&q-key-time={key_time}"
+            f"&q-header-list={header_list}"
+            "&q-url-param-list="
+            f"&q-signature={signature}"
+        )
+
+    @staticmethod
+    def _quote_sign(value):
+        return urllib.parse.quote(str(value), safe="")
 
 
 # ============================================================
@@ -607,6 +728,16 @@ def create_storage_provider(config=None):
             cloud_name=storage_cfg.get("cloud_name", ""),
             api_key=storage_cfg.get("api_key", ""),
             api_secret=storage_cfg.get("api_secret", ""),
+        )
+
+    if provider_name in ("tencent_cos", "cos"):
+        return TencentCOSProvider(
+            secret_id=storage_cfg.get("secret_id", ""),
+            secret_key=storage_cfg.get("secret_key", ""),
+            bucket=storage_cfg.get("bucket", DEFAULT_TENCENT_COS_BUCKET),
+            region=storage_cfg.get("region", DEFAULT_TENCENT_COS_REGION),
+            prefix=storage_cfg.get("prefix", DEFAULT_TENCENT_COS_PREFIX),
+            base_url=storage_cfg.get("base_url", DEFAULT_TENCENT_COS_BASE_URL),
         )
 
     raise ValueError(f"Unknown storage provider: {provider_name}")

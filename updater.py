@@ -10,6 +10,19 @@ VERSION_FILE = os.path.join(SCRIPT_DIR, "version.txt")
 
 
 def _get_local_version():
+    try:
+        result = subprocess.run(
+            ["git", "-C", SCRIPT_DIR, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        sha = result.stdout.strip()
+        if result.returncode == 0 and len(sha) == 40:
+            return sha
+    except Exception:
+        pass
     if os.path.exists(VERSION_FILE):
         with open(VERSION_FILE, "r") as f:
             return f.read().strip()
