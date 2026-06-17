@@ -70,6 +70,53 @@ class UpdaterVersionTests(unittest.TestCase):
 
         self.assertEqual(updater._get_local_version(), version_file_sha)
 
+    def test_check_update_accepts_commit_sha_written_by_old_updater(self):
+        remote_version = "2026.06.17-cos"
+        remote_sha = "c" * 40
+        prompts = []
+        orig_local = updater._get_local_version
+        orig_remote = updater._get_remote_version
+        orig_remote_sha = updater._get_remote_commit_sha
+        orig_ask = updater.messagebox.askyesno
+        try:
+            updater._get_local_version = lambda: remote_sha
+            updater._get_remote_version = lambda: remote_version
+            updater._get_remote_commit_sha = lambda: remote_sha
+            updater.messagebox.askyesno = lambda *args, **kwargs: prompts.append(args) or True
+
+            self.assertTrue(updater.check_and_update(None))
+            self.assertEqual(prompts, [])
+        finally:
+            updater._get_local_version = orig_local
+            updater._get_remote_version = orig_remote
+            updater._get_remote_commit_sha = orig_remote_sha
+            updater.messagebox.askyesno = orig_ask
+
+    def test_check_update_prompts_when_local_matches_neither_remote_marker_nor_sha(self):
+        prompts = []
+        updates = []
+        orig_local = updater._get_local_version
+        orig_remote = updater._get_remote_version
+        orig_remote_sha = updater._get_remote_commit_sha
+        orig_ask = updater.messagebox.askyesno
+        orig_update = updater._do_update
+        try:
+            updater._get_local_version = lambda: "old-version"
+            updater._get_remote_version = lambda: "2026.06.17-cos"
+            updater._get_remote_commit_sha = lambda: "c" * 40
+            updater.messagebox.askyesno = lambda *args, **kwargs: prompts.append(args) or True
+            updater._do_update = lambda remote: updates.append(remote) or True
+
+            self.assertTrue(updater.check_and_update(None))
+            self.assertEqual(len(prompts), 1)
+            self.assertEqual(updates, ["2026.06.17-cos"])
+        finally:
+            updater._get_local_version = orig_local
+            updater._get_remote_version = orig_remote
+            updater._get_remote_commit_sha = orig_remote_sha
+            updater.messagebox.askyesno = orig_ask
+            updater._do_update = orig_update
+
 
 if __name__ == "__main__":
     unittest.main()

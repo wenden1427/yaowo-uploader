@@ -5,6 +5,7 @@ from tkinter import messagebox; import tempfile
 
 REPO_API = "https://api.github.com/repos/wenden1427/yaowo-uploader/commits/main"
 REPO_ZIP = "https://github.com/wenden1427/yaowo-uploader/archive/refs/heads/main.zip"
+REPO_VERSION = "https://raw.githubusercontent.com/wenden1427/yaowo-uploader/main/version.txt"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_FILE = os.path.join(SCRIPT_DIR, "version.txt")
 
@@ -31,27 +32,41 @@ def _get_local_version():
 
 def _get_remote_version():
     try:
+        req = urllib.request.Request(REPO_VERSION, headers={
+            "User-Agent": "YaoWo-Uploader-Updater/1.0",
+        })
+        with _make_network_opener().open(req, timeout=10) as resp:
+            version = resp.read().decode("utf-8", errors="replace").strip()
+            return version or None
+    except Exception:
+        return _get_remote_commit_sha()
+
+
+def _get_remote_commit_sha():
+    try:
         req = urllib.request.Request(REPO_API, headers={
             "User-Agent": "YaoWo-Uploader-Updater/1.0",
             "Accept": "application/vnd.github.v3+json",
         })
-        # Try proxy first (common in China), fall back to direct
-        opener = None
-        try:
-            from config_manager import detect_proxy
-            proxy = detect_proxy()
-            if proxy:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-        except Exception:
-            pass
-        if opener is None:
-            opener = urllib.request.build_opener()
-        with opener.open(req, timeout=10) as resp:
+        with _make_network_opener().open(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return data.get("sha", "")
     except Exception:
         return None
+
+
+def _make_network_opener():
+    """Build an opener that respects the configured/system proxy."""
+    try:
+        from config_manager import detect_proxy
+        proxy = detect_proxy()
+        if proxy:
+            return urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+    except Exception:
+        pass
+    return urllib.request.build_opener()
 
 
 def _save_version(sha):
@@ -62,12 +77,13 @@ def _save_version(sha):
 def check_and_update(root):
     local = _get_local_version()
     remote = _get_remote_version()
+    remote_sha = _get_remote_commit_sha()
     if not remote:
         return True
     if not local:
         _save_version(remote)
         return True
-    if local == remote:
+    if local in {remote, remote_sha}:
         return True
 
     result = messagebox.askyesno(
@@ -85,7 +101,7 @@ def _do_update(remote_sha):
         extract_dir = os.path.join(tempfile.gettempdir(), "yaowo_uploader_update_extract")
 
         req = urllib.request.Request(REPO_ZIP, headers={"User-Agent": "YaoWo-Uploader-Updater/1.0"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with _make_network_opener().open(req, timeout=60) as resp:
             with open(tmp, "wb") as f:
                 f.write(resp.read())
 
