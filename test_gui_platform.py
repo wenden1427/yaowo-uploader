@@ -44,6 +44,17 @@ class FakeRoot:
         self.style = FakeStyle()
 
 
+class FakeCanvas:
+    def __init__(self):
+        self.actions = []
+
+    def delete(self, *args):
+        self.actions.append(("delete", args))
+
+    def create_text(self, *args, **kwargs):
+        self.actions.append(("create_text", args, kwargs))
+
+
 class PlatformSwitchTests(unittest.TestCase):
     def setUp(self):
         self._orig_load_config = gui.load_config
@@ -96,6 +107,24 @@ class PlatformSwitchTests(unittest.TestCase):
         app._on_toolbar_setting_changed("image_prompt")
 
         self.assertEqual(saved, [{"platform": "shein", "image_prompt": "generic"}])
+
+    def test_title_mode_setting_change_saves_config(self):
+        app = UploaderApp.__new__(UploaderApp)
+        app._title_mode_var = FakeVar("brand_only")
+        saved = []
+        gui.load_config = lambda: {"platform": "shein"}
+        gui.save_config = lambda cfg: saved.append(dict(cfg))
+
+        app._on_toolbar_setting_changed("title_mode")
+
+        self.assertEqual(saved, [{"platform": "shein", "title_mode": "brand_only"}])
+
+    def test_toolbar_exposes_brand_only_title_mode(self):
+        source = inspect.getsource(UploaderApp._setup_toolbar)
+
+        self.assertIn("AI重写", source)
+        self.assertIn("仅去品牌", source)
+        self.assertIn("title_mode", source)
 
     def test_theme_change_saves_config(self):
         app = UploaderApp.__new__(UploaderApp)
@@ -165,6 +194,22 @@ class PlatformSwitchTests(unittest.TestCase):
 
         self.assertTrue(app._is_current_preview(2))
         self.assertFalse(app._is_current_preview(1))
+
+    def test_test_image_error_draws_full_message_on_canvas(self):
+        app = UploaderApp.__new__(UploaderApp)
+        app._img_result = FakeCanvas()
+        app._test_status = type("Status", (), {"configure": lambda self, **kwargs: None})()
+        app._test_url_var = type("Var", (), {"set": lambda self, value: None})()
+        app._copy_btn = type("Button", (), {"configure": lambda self, **kwargs: None})()
+        msg = "no reference images could be downloaded: https://ae-pic-a1.example.com/kf/very-long-url.jpg: HTTP 403"
+
+        app._show_test_error(msg)
+
+        text_actions = [a for a in app._img_result.actions if a[0] == "create_text"]
+        self.assertEqual(len(text_actions), 1)
+        self.assertIn("very-long-url.jpg", text_actions[0][2]["text"])
+        self.assertIn("width", text_actions[0][2])
+        self.assertEqual(app._last_test_error, msg)
 
 
 if __name__ == "__main__":
