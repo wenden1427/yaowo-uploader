@@ -4,6 +4,7 @@
 
 import os
 import re
+import json
 import time
 import threading
 import io
@@ -220,8 +221,11 @@ def write_product_row(tws, row_idx, prod, fixed, tpl_start_row):
 
 # ---- Phase 1: Serial per-product ----
 
-def phase1_title(prod, banned_words, prompts):
-    """Generate Korean title via DeepSeek."""
+def phase1_title(prod, banned_words, prompts, title_mode="ai_rewrite"):
+    """Generate or clean title according to the selected title mode."""
+    if _is_brand_only_title_mode(title_mode):
+        return phase1_title_brand_only(prod.title, banned_words)
+
     is_multi = len(prod.colors) > 1
     color_note = ""
     if is_multi:
@@ -250,6 +254,107 @@ def phase1_title(prod, banned_words, prompts):
     if len(title) > 45:
         title = title[:45]
     return title
+
+
+def phase1_title_brand_only(title, banned_words):
+    """Ask DeepSeek which words are brands, then remove only those words locally."""
+    brand_words = identify_brand_words_in_title(title, banned_words)
+    return remove_brand_words_from_title(title, brand_words)
+
+
+def identify_brand_words_in_title(title, banned_words):
+    title = str(title or "")
+    hints = _brand_hint_words(title, banned_words)
+    hint_text = ", ".join(hints) if hints else "无"
+    prompt = f"""请只识别下面商品标题里的品牌名、商标名、店铺名或公司名。
+不要改写标题，不要翻译标题，不要删除颜色、规格、材质、品类、数量、用途词。
+只输出 JSON 数组，例如 ["ZARA", "JBL"]；如果没有品牌名，输出 []。
+
+商品标题：{title}
+可疑品牌参考词：{hint_text}"""
+    result = deepseek_chat(prompt, max_tokens=120, temp=0)
+    return _parse_brand_words_response(result, title)
+
+
+def remove_brand_words_from_title(title, banned_words):
+    """Remove configured brand/forbidden words while leaving title text otherwise intact."""
+    cleaned = str(title or "")
+    for word in _iter_brand_words(banned_words):
+        pattern = re.compile(r"(?<![A-Za-z0-9])" + re.escape(word) + r"(?![A-Za-z0-9])", re.IGNORECASE)
+        cleaned = pattern.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"\s+([,.;:!?，。；：！？])", r"\1", cleaned)
+    return cleaned
+
+
+def _is_brand_only_title_mode(title_mode):
+    return str(title_mode or "").strip() in ("brand_only", "仅去品牌")
+
+
+def _brand_hint_words(title, banned_words):
+    title_text = str(title or "")
+    hints = []
+    for word in _iter_brand_words(banned_words):
+        pattern = re.compile(r"(?<![A-Za-z0-9])" + re.escape(word) + r"(?![A-Za-z0-9])", re.IGNORECASE)
+        if pattern.search(title_text):
+            hints.append(word)
+        if len(hints) >= 30:
+            break
+    return hints
+
+
+def _parse_brand_words_response(text, title):
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    json_match = re.search(r"\[[\s\S]*\]", raw)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(0))
+            if isinstance(data, list):
+                return _clean_brand_word_list(data, title)
+        except Exception:
+            pass
+    if raw.strip().lower() in ("[]", "none", "no brand", "no brands", "n/a"):
+        return []
+    if raw.strip() in ("无", "没有", "无品牌", "没有品牌"):
+        return []
+    raw = re.sub(r"^[A-Za-z\u4e00-\u9fff\s]*(?:品牌|brand|brands)\s*[:：]\s*", "", raw, flags=re.IGNORECASE)
+    parts = re.split(r"[,，;；\n\r]+", raw)
+    return _clean_brand_word_list(parts, title)
+
+
+def _clean_brand_word_list(words, title):
+    title_text = str(title or "").strip()
+    cleaned = []
+    seen = set()
+    for item in words or []:
+        word = str(item).strip().strip("\"'`[]()（）")
+        word = re.sub(r"^\s*[-*•]\s*", "", word).strip()
+        if not word or word in ("无", "没有", "[]"):
+            continue
+        if word == title_text:
+            continue
+        key = word.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(word)
+    return cleaned
+
+
+def _iter_brand_words(banned_words):
+    seen = set()
+    for item in banned_words or []:
+        for part in re.split(r"[,，\n\r]+", str(item)):
+            word = part.strip()
+            if not word or len(word) < 2:
+                continue
+            key = word.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            yield word
 
 
 # ---- Profile key to Korean translation (DeepSeek + JSON cache) ----
@@ -761,6 +866,7 @@ class ProcessingPipeline:
         banned_path = os.path.join(SKILL_DIR, "uploader", "违禁词gmk.txt")
         banned_words = load_banned_words(banned_path) if os.path.exists(banned_path) else []
         storage = create_storage_provider(cfg)
+        title_mode = cfg.get("title_mode", "AI重写")
         prompt_text = prompts.get(self.prompt_key, prompts.get("generic", ""))
         batch_size = cfg.get("batch_size", 10)
         total = len(products)
@@ -796,7 +902,7 @@ class ProcessingPipeline:
                 try:
                     prod.status = ProductStatus.PHASE1_TITLE
                     self.progress_cb(real_idx + 1, total, f"#{real_idx + 1} 标题生成中...")
-                    prod.ai_title = phase1_title(prod, banned_words, prompts)
+                    prod.ai_title = phase1_title(prod, banned_words, prompts, title_mode=title_mode)
                     ds_count += 1
                     prod.logs.append(f"{time.strftime('%H:%M:%S')} 标题生成完成")
                     self.progress_cb(real_idx + 1, total, f"#{real_idx + 1} 标题完成")

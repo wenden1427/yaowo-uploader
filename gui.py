@@ -126,16 +126,20 @@ class UploaderApp:
         tb.Separator(tbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         tb.Label(tbar, text="标题:").pack(side=tk.LEFT, padx=2)
         all_profiles = list(load_prompts().keys())
-        title_profile = cfg.get("title_profile", "title")
-        if title_profile not in all_profiles:
-            title_profile = "title"
-        self._title_profile_var = tk.StringVar(value=title_profile)
-        self._title_profile_cb = tb.Combobox(tbar, textvariable=self._title_profile_var,
-                                              values=["title"], state="readonly", width=10)
-        self._title_profile_cb.pack(side=tk.LEFT, padx=2)
-        self._title_profile_cb.bind(
+        title_mode = cfg.get("title_mode", "AI重写")
+        if title_mode not in ("AI重写", "仅去品牌", "ai_rewrite", "brand_only"):
+            title_mode = "AI重写"
+        if title_mode == "ai_rewrite":
+            title_mode = "AI重写"
+        elif title_mode == "brand_only":
+            title_mode = "仅去品牌"
+        self._title_mode_var = tk.StringVar(value=title_mode)
+        self._title_mode_cb = tb.Combobox(tbar, textvariable=self._title_mode_var,
+                                          values=["AI重写", "仅去品牌"], state="readonly", width=10)
+        self._title_mode_cb.pack(side=tk.LEFT, padx=2)
+        self._title_mode_cb.bind(
             "<<ComboboxSelected>>",
-            lambda e: self._on_toolbar_setting_changed("title_profile"))
+            lambda e: self._on_toolbar_setting_changed("title_mode"))
         tb.Label(tbar, text="生图:").pack(side=tk.LEFT, padx=(8, 2))
         img_profiles = [k for k in all_profiles if k != "title"] or ["generic"]
         img_profile = cfg.get("image_prompt", cfg.get("img_profile", img_profiles[0]))
@@ -228,11 +232,15 @@ class UploaderApp:
             self._tpl_btn.configure(text=os.path.basename(self.template_path))
         # Restore profile settings
         img_p = state.get("img_profile", "generic")
-        title_p = state.get("title_profile", "title")
+        title_p = state.get("title_mode", state.get("title_profile", "AI重写"))
         if img_p in self._img_profile_cb["values"]:
             self._img_profile_var.set(img_p)
-        if title_p in self._title_profile_cb["values"]:
-            self._title_profile_var.set(title_p)
+        if title_p == "ai_rewrite":
+            title_p = "AI重写"
+        elif title_p == "brand_only":
+            title_p = "仅去品牌"
+        if title_p in self._title_mode_cb["values"]:
+            self._title_mode_var.set(title_p)
         platform = state.get("platform")
         if platform in ("shein", "aliexpress"):
             self._platform_var.set(platform)
@@ -833,8 +841,15 @@ class UploaderApp:
         self._copy_btn.configure(state="normal")
 
     def _show_test_error(self, msg):
+        self._last_test_error = msg
         self._img_result.delete("all")
-        self._img_result.create_text(100, 100, text=f"错误: {msg[:60]}", fill="#c00")
+        self._img_result.create_text(
+            10, 10,
+            text=f"错误:\n{msg}",
+            fill="#c00",
+            anchor=tk.NW,
+            width=520,
+        )
         self._test_status.configure(text="生图失败", foreground="#c0392b")
         self._test_url_var.set("")
         self._copy_btn.configure(state="disabled")
@@ -852,7 +867,7 @@ class UploaderApp:
     def _on_toolbar_setting_changed(self, key, event=None):
         """Save toolbar dropdown choices that should persist across restarts."""
         vars_by_key = {
-            "title_profile": "_title_profile_var",
+            "title_mode": "_title_mode_var",
             "image_prompt": "_img_profile_var",
             "platform": "_platform_var",
         }
@@ -1433,6 +1448,11 @@ ParentSKU 并跳过，只处理剩余的。
 
         cfg = load_config()
         prompts = load_prompts()
+        title_mode = self._title_mode_var.get()
+        if title_mode == "仅去品牌":
+            title_mode = "brand_only"
+        elif title_mode == "AI重写":
+            title_mode = "ai_rewrite"
         prompt_key = self._img_profile_var.get()
         prompt_text = prompts.get(prompt_key, prompts.get("generic", ""))
         storage = create_storage_provider(cfg)
@@ -1453,7 +1473,7 @@ ParentSKU 并跳过，只处理剩余的。
             try:
                 prod.status = ProductStatus.PHASE1_TITLE
                 self.root.after(0, lambda i=idx, p=prod: self.update_product_status(i, p))
-                prod.ai_title = phase1_title(prod, banned_words, prompts)
+                prod.ai_title = phase1_title(prod, banned_words, prompts, title_mode=title_mode)
 
                 prod.status = ProductStatus.PHASE1_CATEGORY
                 self.root.after(0, lambda i=idx, p=prod: self.update_product_status(i, p))
@@ -1552,7 +1572,7 @@ ParentSKU 并跳过，只处理剩余的。
             "output_path": getattr(getattr(self, '_pipeline', None), 'output_path', None),
             "products": self.products,
             "img_profile": self._img_profile_var.get(),
-            "title_profile": self._title_profile_var.get(),
+            "title_mode": self._title_mode_var.get(),
             "platform": self._platform_var.get(),
             "mode": self._mode_var.get(),
             "stats": self._stats,
