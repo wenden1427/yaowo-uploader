@@ -53,6 +53,27 @@ class TitleModeTests(unittest.TestCase):
 
         self.assertEqual(title, "Foldable Storage Rack 2pcs")
 
+    def test_brand_only_mode_limits_title_to_45_chars_at_word_boundary(self):
+        processor.deepseek_chat = lambda *args, **kwargs: '["ZARA"]'
+        original = "ZARA Premium Foldable Storage Rack Organizer Sparkling Lamp"
+        prod = Product(title=original)
+
+        title = processor.phase1_title(
+            prod,
+            [],
+            prompts={},
+            title_mode="brand_only",
+        )
+
+        expected = "Premium Foldable Storage Rack Organizer"
+        self.assertEqual(title, expected)
+        self.assertLessEqual(len(title), 45)
+
+    def test_title_limit_falls_back_to_hard_cut_when_no_nearby_boundary(self):
+        title = processor._limit_title_length("A" * 60)
+
+        self.assertEqual(title, "A" * 45)
+
 
 if __name__ == "__main__":
     unittest.main()
