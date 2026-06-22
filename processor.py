@@ -250,16 +250,38 @@ def phase1_title(prod, banned_words, prompts, title_mode="ai_rewrite"):
 违禁词：{', '.join(banned_words)}"""
     result = deepseek_chat(prompt, max_tokens=150, temp=0.7)
     title = result.strip()
-    # Hard truncate to 45 characters — Gmarket strict limit
-    if len(title) > 45:
-        title = title[:45]
-    return title
+    return _limit_title_length(title)
 
 
 def phase1_title_brand_only(title, banned_words):
     """Ask DeepSeek which words are brands, then remove only those words locally."""
     brand_words = identify_brand_words_in_title(title, banned_words)
-    return remove_brand_words_from_title(title, brand_words)
+    return _limit_title_length(remove_brand_words_from_title(title, brand_words))
+
+
+def _limit_title_length(title, max_len=45):
+    title = str(title or "")
+    if len(title) <= max_len:
+        return title
+
+    cut = title[:max_len].rstrip()
+    if not cut:
+        return cut
+
+    separators = r"\s,.;:!?，。；：！？、/\\|+\-–—_~·()\[\]{}<>《》「」『』"
+    if max_len < len(title) and re.match(f"[{separators}]", title[max_len]):
+        return re.sub(f"[{separators}]+$", "", cut).rstrip()
+
+    matches = list(re.finditer(f"[{separators}]+", cut))
+    if matches:
+        last = matches[-1]
+        min_keep = max_len - 18
+        if last.start() >= min_keep:
+            candidate = cut[:last.start()].rstrip()
+            if candidate:
+                return re.sub(f"[{separators}]+$", "", candidate).rstrip()
+
+    return cut
 
 
 def identify_brand_words_in_title(title, banned_words):
