@@ -35,6 +35,7 @@ class Product:
     extra_imgs: list[str] = field(default_factory=list)
     variant_imgs: list[str] = field(default_factory=list)
     desc_images: list[str] = field(default_factory=list)
+    ai_source_image_url: str = ""
     platform: str = "shein"
     price: str = ""
     url: str = ""

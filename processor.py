@@ -8,6 +8,8 @@ import json
 import time
 import threading
 import io
+from dataclasses import dataclass
+from urllib.parse import urlsplit, urlunsplit
 from openpyxl import load_workbook
 
 from models import Product, Batch, ProductStatus
@@ -198,7 +200,7 @@ def write_product_row(tws, row_idx, prod, fixed, tpl_start_row):
     # Z: main image URL
     tws.cell(row=r, column=26, value=prod.result.get("Z", prod.main_img))
     # AA: variant images
-    tws.cell(row=r, column=27, value=prod.result.get("AA", ""))
+    tws.cell(row=r, column=27, value=_dedupe_csv_urls(prod.result.get("AA", "")))
     # AB: detail HTML
     tws.cell(row=r, column=28, value=prod.result.get("AB", ""))
     # AD~AM: fixed
@@ -704,25 +706,92 @@ BASE_REFERENCE_PROMPT = (
 )
 
 
-def _dedupe_http_urls(urls, limit=6):
+@dataclass
+class UploadImageCandidates:
+    main: str
+    secondary: list[str]
+
+
+def normalize_image_url_for_dedupe(url):
+    """Normalize source image URLs so resized AliExpress variants dedupe together."""
+    if not url or not isinstance(url, str):
+        return ""
+    raw = url.strip()
+    try:
+        parts = urlsplit(raw)
+    except Exception:
+        return raw
+    path = re.sub(r"(?i)_thumbnail[^/]*(\.[a-z0-9]+)$", r"\1", parts.path)
+    path = re.sub(r"(?i)(\.(?:jpg|jpeg|png|webp|gif))(?:_[^/?#]*)+$", r"\1", path)
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, "", ""))
+
+
+def _dedupe_http_urls(urls, limit=6, exclude_keys=None):
     refs = []
+    seen = set(exclude_keys or ())
     for url in urls:
         if not url or not isinstance(url, str) or not url.startswith("http"):
             continue
-        if url not in refs:
-            refs.append(url)
+        key = normalize_image_url_for_dedupe(url)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        refs.append(url)
         if len(refs) >= limit:
             break
     return refs
 
 
+def _dedupe_exact_http_urls(urls, limit=None):
+    refs = []
+    seen = set()
+    for url in urls:
+        if not url or not isinstance(url, str) or not url.startswith("http"):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        refs.append(url)
+        if limit is not None and len(refs) >= limit:
+            break
+    return refs
+
+
+def _dedupe_csv_urls(value):
+    urls = [u.strip() for u in str(value or "").split(",")]
+    return ",".join(_dedupe_exact_http_urls(urls))
+
+
+def collect_upload_image_candidates(prod, secondary_limit=None):
+    """Collect upload image candidates before generation/upload dedupe."""
+    if prod.platform == "aliexpress":
+        main = prod.variant_imgs[0] if prod.variant_imgs else prod.main_img
+        secondary_seed = []
+        if prod.variant_imgs:
+            secondary_seed.extend(prod.variant_imgs[1:])
+        else:
+            secondary_seed.extend(prod.extra_imgs)
+    else:
+        main = prod.main_img
+        secondary_seed = list(prod.variant_imgs) + list(prod.extra_imgs)
+
+    main_refs = _dedupe_http_urls([main], limit=1)
+    main = main_refs[0] if main_refs else ""
+    exclude = {normalize_image_url_for_dedupe(main)} if main else set()
+    secondary = _dedupe_http_urls(
+        secondary_seed,
+        limit=secondary_limit or 10_000,
+        exclude_keys=exclude,
+    )
+    return UploadImageCandidates(main=main, secondary=secondary)
+
+
 def collect_generation_refs(prod, limit=6):
     """Collect image-generation refs with first image as the base reference."""
+    candidates = collect_upload_image_candidates(prod)
     if prod.platform == "aliexpress":
-        base = prod.variant_imgs[0] if prod.variant_imgs else prod.main_img
-    else:
-        base = prod.main_img
-    return _dedupe_http_urls([base] + list(prod.extra_imgs), limit=limit)
+        return _dedupe_http_urls([candidates.main] + candidates.secondary, limit=limit)
+    return _dedupe_http_urls([candidates.main] + list(prod.extra_imgs), limit=limit)
 
 
 def build_generation_prompt(prompt):
@@ -736,6 +805,7 @@ def build_generation_prompt(prompt):
 def _gen_main_image(prod, prompt, storage):
     """Generate main image. AliExpress: 1st variant image as reference. Shein: main+extra."""
     refs = collect_generation_refs(prod)
+    prod.ai_source_image_url = refs[0] if refs else ""
     prompt = build_generation_prompt(prompt)
     last_err = None
     for attempt in range(3):  # initial + 2 retries
@@ -806,15 +876,18 @@ def _gen_detail_html(prod, all_products, storage):
 def _collect_variant_imgs(prod, storage):
     """Collect variant images for AA column. Downloads, ensures >=600x600 / <=2MB,
     uploads to Cloudinary, returns comma-separated Cloudinary URLs."""
-    # Gather source URLs
+    candidates = collect_upload_image_candidates(prod)
+    source_key = normalize_image_url_for_dedupe(prod.ai_source_image_url)
+    exclude = {source_key} if source_key else set()
     if prod.platform == "aliexpress":
-        urls = prod.variant_imgs[1:] if len(prod.variant_imgs) > 1 else []
+        urls = _dedupe_http_urls(candidates.secondary, limit=10_000, exclude_keys=exclude)
     else:
-        main_stem = _url_stem(prod.main_img)
-        urls = [u for u in prod.variant_imgs if _url_stem(u) != main_stem]
-    if not urls and len(prod.colors) <= 1:
-        urls = [u for u in prod.extra_imgs[:2]
-                if _url_stem(u) != _url_stem(prod.main_img)][:2]
+        main_key = normalize_image_url_for_dedupe(candidates.main)
+        if main_key:
+            exclude.add(main_key)
+        urls = _dedupe_http_urls(prod.variant_imgs, limit=10_000, exclude_keys=exclude)
+        if not urls and len(prod.colors) <= 1:
+            urls = _dedupe_http_urls(prod.extra_imgs, limit=2, exclude_keys=exclude)
     # Download, fix, upload each to Cloudinary
     safe_urls = []
     for u in urls:
@@ -825,7 +898,7 @@ def _collect_variant_imgs(prod, storage):
             safe_urls.append(cloud_url)
         except Exception as e:
             prod.logs.append(f"{time.strftime('%H:%M:%S')} 变种图跳过: {e}")
-    return ",".join(safe_urls) if safe_urls else ""
+    return ",".join(_dedupe_exact_http_urls(safe_urls)) if safe_urls else ""
 
 
 # ---- Main Pipeline ----

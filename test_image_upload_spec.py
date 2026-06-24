@@ -121,6 +121,52 @@ class ImageUploadSpecTests(unittest.TestCase):
         self.assertEqual(result, "http://cloudinary/main.jpg")
         self.assertEqual(uploaded_sizes, [(601, 600)])
 
+    def test_ai_source_image_is_excluded_from_variant_uploads(self):
+        prod = Product(
+            parent_sku="A1",
+            main_img="https://ae-pic-a1.aliexpress-media.com/kf/Smain.jpg",
+            platform="aliexpress",
+        )
+        prod.variant_imgs = [
+            "https://ae-pic-a1.aliexpress-media.com/kf/Sblue.jpg",
+            "https://ae-pic-a1.aliexpress-media.com/kf/Sblue.jpg_960x960.jpg",
+            "https://ae-pic-a1.aliexpress-media.com/kf/Sred.jpg",
+        ]
+        prod.extra_imgs = [
+            "https://ae-pic-a1.aliexpress-media.com/kf/Sblue.jpg_120x120.jpg_.webp",
+            "https://ae-pic-a1.aliexpress-media.com/kf/Sdetail.jpg",
+        ]
+        refs_seen = []
+        downloaded = []
+        processor.generate_image = lambda prompt, refs: refs_seen.extend(refs) or make_jpeg(640, 640)
+        processor.download_image = lambda url: downloaded.append(url) or make_jpeg(640, 640)
+
+        class RecordingStorage:
+            def __init__(self):
+                self.names = []
+
+            def upload(self, image_bytes, filename="image.jpg"):
+                self.names.append(filename)
+                return f"http://cloud/{filename}"
+
+        storage = RecordingStorage()
+
+        main_url = processor._gen_main_image(prod, "prompt", storage)
+        variant_urls = processor._collect_variant_imgs(prod, storage)
+
+        self.assertEqual(main_url, "http://cloud/main_A1.jpg")
+        self.assertEqual(prod.ai_source_image_url, "https://ae-pic-a1.aliexpress-media.com/kf/Sblue.jpg")
+        self.assertEqual(refs_seen[0], prod.ai_source_image_url)
+        self.assertNotIn("https://ae-pic-a1.aliexpress-media.com/kf/Sblue.jpg_960x960.jpg", downloaded)
+        self.assertNotIn("https://ae-pic-a1.aliexpress-media.com/kf/Sblue.jpg_120x120.jpg_.webp", downloaded)
+        self.assertEqual(
+            downloaded,
+            [
+                "https://ae-pic-a1.aliexpress-media.com/kf/Sred.jpg",
+            ],
+        )
+        self.assertIn("http://cloud/var_", variant_urls)
+
 
 if __name__ == "__main__":
     unittest.main()
