@@ -1441,7 +1441,7 @@ ParentSKU 并跳过，只处理剩余的。
         threading.Thread(target=self._do_batch_regen, args=(list(self._checked_products),), daemon=True).start()
 
     def _do_batch_regen(self, items):
-        from processor import phase1_title, phase1_category, phase1_price, phase1_w_type, phase1_x_attr, phase1_y_list
+        from processor import phase1_title, phase1_category, ensure_upload_category_codes, phase1_price, phase1_w_type, phase1_x_attr, phase1_y_list
         from processor import _gen_main_image, _gen_detail_html, _collect_variant_imgs, _get_category_zh
         from config_manager import load_config, load_prompts, load_categories, load_banned_words
         from api_client import create_storage_provider
@@ -1478,6 +1478,7 @@ ParentSKU 并跳过，只处理剩余的。
                 prod.status = ProductStatus.PHASE1_CATEGORY
                 self.root.after(0, lambda i=idx, p=prod: self.update_product_status(i, p))
                 cat_path, k, l, m = phase1_category(prod, categories, prompt_key)
+                ensure_upload_category_codes(k, l, m)
                 prod.result["K"] = k
                 prod.result["L"] = l
                 prod.result["M"] = m
