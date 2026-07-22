@@ -442,12 +442,28 @@ def match_store_category(store_id, product, category_path="", category_zh="",
         return {"category_id": candidates[0]["id"], "confidence": 1.0,
                 "method": "single", "evidence": ["店铺仅配置一个类目"]}
 
-    text = " ".join((
-        str(category_zh or ""), str(category_path or ""),
-        str(getattr(product, "title", "") or ""),
-        str(getattr(product, "tag", "") or ""),
-        str(getattr(product, "brand", "") or ""),
-    ))
+    subject_profile = getattr(product, "subject_profile", {}) or {}
+    subject_identity = " ".join(
+        str(subject_profile.get(key, "") or "").strip()
+        for key in ("sold_object_ko", "sold_object_zh", "sold_object",
+                    "buyer_receives", "primary_function")
+    ).strip()
+    generated_terms = []
+    for key in ("category_terms_ko", "category_terms_zh"):
+        values = subject_profile.get(key, [])
+        if not isinstance(values, list):
+            values = [values] if values else []
+        generated_terms.extend(str(value or "").strip() for value in values if value)
+    subject_identity = " ".join([subject_identity] + generated_terms).strip()
+    if subject_identity:
+        product_context = subject_identity
+    else:
+        product_context = " ".join((
+            str(getattr(product, "title", "") or ""),
+            str(getattr(product, "tag", "") or ""),
+            str(getattr(product, "brand", "") or ""),
+        ))
+    text = " ".join((str(category_zh or ""), str(category_path or ""), product_context))
     scored = []
     for category in candidates:
         scored.append((_alias_score(text, [category["name"]]), category))
@@ -470,6 +486,9 @@ def match_store_category(store_id, product, category_path="", category_zh="",
         for category in candidates
     ]
     prompt = (
+        "Classify the actual item the buyer receives. Do not classify an object that "
+        "the sold item stores, supports, protects, connects to, fits, controls, or is "
+        "shown with. The sold-item analysis is authoritative over noisy raw tags.\n"
         "你是店铺业务大类选择器。商品的韩国平台精确类目已经匹配完成，"
         "现在必须从候选店铺大类中选择最接近的一个，用于取得该店铺对应的 AL/AM。"
         "候选项是宽泛的业务大类，不要求与商品精确类目同名。"
@@ -477,8 +496,9 @@ def match_store_category(store_id, product, category_path="", category_zh="",
         "category_id 必须原样复制候选项中的 category_id，不能填写类目名称。"
         "严禁编造候选池之外的 category_id 或代码。"
         "只输出 JSON：category_id、confidence、evidence。\n\n"
+        f"售卖主体分析：{json.dumps(subject_profile, ensure_ascii=False)}\n"
         f"商品标题：{getattr(product, 'title', '')}\n"
-        f"商品标签：{getattr(product, 'tag', '')}\n"
+        f"商品标签（可能含噪声）：{getattr(product, 'tag', '')}\n"
         f"匹配后的韩国类目：{category_path}\n"
         f"匹配后的中文类目：{category_zh}\n"
         f"候选店铺类目：{json.dumps(prompt_candidates, ensure_ascii=False)}"
@@ -496,11 +516,14 @@ def match_store_category(store_id, product, category_path="", category_zh="",
     category = _find_category_by_id_or_name(store, category_id)
     if not category:
         repair_prompt = (
+            "Use the sold-item analysis to classify the physical item the buyer receives, "
+            "not a referenced or compatible object. "
             "上一次返回无效。现在必须从候选业务大类中选择且只能选择一个，禁止返回空值，"
             "禁止解释没有精确类目。category_id 必须原样复制候选项中的 category_id。"
             "只输出 JSON：category_id、confidence、evidence。\n\n"
+            f"售卖主体分析：{json.dumps(subject_profile, ensure_ascii=False)}\n"
             f"商品标题：{getattr(product, 'title', '')}\n"
-            f"商品标签：{getattr(product, 'tag', '')}\n"
+            f"商品标签（可能含噪声）：{getattr(product, 'tag', '')}\n"
             f"匹配后的韩国类目：{category_path}\n"
             f"匹配后的中文类目：{category_zh}\n"
             f"候选店铺大类：{json.dumps(prompt_candidates, ensure_ascii=False)}"

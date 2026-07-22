@@ -27,6 +27,7 @@ class Product:
     parent_sku: str = ""
     title: str = ""
     ai_title: str = ""
+    subject_profile: dict = field(default_factory=dict)
     tag: str = ""
     brand: str = ""
     colors: list[str] = field(default_factory=list)
