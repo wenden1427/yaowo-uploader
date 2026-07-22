@@ -8,6 +8,16 @@ REPO_ZIP = "https://github.com/wenden1427/yaowo-uploader/archive/refs/heads/main
 REPO_VERSION = "https://raw.githubusercontent.com/wenden1427/yaowo-uploader/main/version.txt"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_FILE = os.path.join(SCRIPT_DIR, "version.txt")
+PRESERVED_FILES = {
+    ".gitignore",
+    ".uploader_state.pkl",
+    "categories_zh.json",
+    "config.yaml",
+    "profile_ko.json",
+    "prompts.yaml",
+    "store_profiles.yaml",
+}
+SKIPPED_DIRS = {".git", "__pycache__", "python-portable"}
 
 
 def _get_local_version():
@@ -76,6 +86,25 @@ def _save_version(sha):
         f.write(sha)
 
 
+def _copy_update_tree(source_root, destination_root):
+    """Copy an update recursively while preserving user-owned configuration."""
+    for current_root, dirnames, filenames in os.walk(source_root):
+        dirnames[:] = [name for name in dirnames if name not in SKIPPED_DIRS]
+        relative = os.path.relpath(current_root, source_root)
+        destination_dir = (
+            destination_root if relative == "."
+            else os.path.join(destination_root, relative)
+        )
+        os.makedirs(destination_dir, exist_ok=True)
+        for filename in filenames:
+            if relative == "." and filename in PRESERVED_FILES:
+                continue
+            shutil.copy2(
+                os.path.join(current_root, filename),
+                os.path.join(destination_dir, filename),
+            )
+
+
 def check_and_update(root):
     local = _get_local_version()
     remote = _get_remote_version()
@@ -117,13 +146,7 @@ def _do_update(remote_sha):
             messagebox.showerror("更新失败", "更新包结构异常")
             return True
 
-        for item in os.listdir(inner):
-            src = os.path.join(inner, item)
-            dst = os.path.join(SCRIPT_DIR, item)
-            if item == ".gitignore":
-                continue
-            if os.path.isfile(src):
-                shutil.copy2(src, dst)
+        _copy_update_tree(inner, SCRIPT_DIR)
 
         os.remove(tmp)
         shutil.rmtree(extract_dir)

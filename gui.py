@@ -6,13 +6,28 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 import ttkbootstrap as tb
 import os
+import re
 import threading
 import time
 
 from models import ProductStatus
 from config_manager import load_config, save_config, load_prompts, save_prompts
+from store_profiles import (
+    best_category_for_text,
+    category_fields,
+    find_category,
+    find_store,
+    import_template_profile,
+    load_store_profiles,
+    match_store_category,
+    save_store_profiles,
+    suggest_source_profile,
+    validate_store_profile,
+)
 
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
+PROFILE_MODE_STORE = "按店铺"
+PROFILE_MODE_TEMPLATE = "按旧模板"
 
 # ---- Color scheme & constants ----
 STATUS_COLORS = {
@@ -45,8 +60,12 @@ class UploaderApp:
         self._apply_warnings()
         # State
         self.source_path = None
-        self.template_path = None
+        default_template = os.path.join(SKILL_DIR, "uploader", "韩国上传模板.xlsx")
+        self.template_path = default_template if os.path.isfile(default_template) else None
+        if self.template_path:
+            self._tpl_btn.configure(text="韩国上传模板.xlsx（通用）")
         self.products = []
+        self._profile_confirmed = True
         self._processing = False
         self._paused = False
         self._stopped = False
@@ -95,6 +114,7 @@ class UploaderApp:
         sm.add_command(label="API 配置...", command=self._open_api_settings)
         sm.add_command(label="价格系数...", command=self._open_price_settings)
         sm.add_command(label="提示词管理...", command=self._open_prompt_manager)
+        sm.add_command(label="店铺和类目设置...", command=self._open_store_settings)
         sm.add_separator()
         sm.add_command(label="处理设置...", command=self._open_batch_settings)
         # Theme submenu
@@ -173,19 +193,51 @@ class UploaderApp:
                                           state="readonly", width=10)
         self._platform_cb.pack(side=tk.LEFT, padx=2)
         self._platform_cb.bind("<<ComboboxSelected>>", self._on_platform_changed)
-        tb.Separator(tbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        self._start_btn = tb.Button(tbar, text="开 始", command=self._start_processing,
-                                    bootstyle="success")
-        self._start_btn.pack(side=tk.LEFT, padx=4)
-        self._export_btn = tb.Button(tbar, text="导出上架表", command=self._do_export,
-                                     bootstyle="primary")
-        self._export_btn.pack(side=tk.LEFT, padx=4)
-        self._batch_regen_btn = tb.Button(tbar, text="重新生成选中", command=self._regenerate_checked,
-                                          bootstyle="warning")
-        self._batch_regen_btn.pack(side=tk.LEFT, padx=4)
-        tb.Label(tbar, text="", font=("", 1)).pack(side=tk.LEFT, padx=6)
         self._mode_var = tk.StringVar(value="等待开始...")
-        tb.Label(tbar, textvariable=self._mode_var, foreground="gray").pack(side=tk.LEFT)
+
+        profile_bar = tb.Frame(self.root, padding=(4, 0, 4, 4))
+        profile_bar.pack(fill=tk.X)
+        self._start_btn = tb.Button(profile_bar, text="开 始", command=self._start_processing,
+                                    bootstyle="success")
+        self._export_btn = tb.Button(profile_bar, text="导出上架表", command=self._do_export,
+                                     bootstyle="primary")
+        self._batch_regen_btn = tb.Button(
+            profile_bar, text="重新生成选中", command=self._regenerate_checked,
+            bootstyle="warning")
+        self._batch_regen_btn.pack(side=tk.RIGHT, padx=3)
+        self._export_btn.pack(side=tk.RIGHT, padx=3)
+        self._start_btn.pack(side=tk.RIGHT, padx=3)
+        tb.Label(profile_bar, textvariable=self._mode_var,
+                 foreground="gray", width=9).pack(side=tk.RIGHT, padx=4)
+        self._profile_data = load_store_profiles()
+        profile_mode = cfg.get("profile_mode", "store")
+        self._profile_mode_var = tk.StringVar(
+            value=PROFILE_MODE_TEMPLATE if profile_mode == "template" else PROFILE_MODE_STORE)
+        tb.Label(profile_bar, text="固定值来源:").pack(side=tk.LEFT, padx=2)
+        self._profile_mode_cb = tb.Combobox(
+            profile_bar, textvariable=self._profile_mode_var,
+            values=[PROFILE_MODE_STORE, PROFILE_MODE_TEMPLATE], state="readonly", width=9)
+        self._profile_mode_cb.pack(side=tk.LEFT, padx=2)
+        self._profile_mode_cb.bind("<<ComboboxSelected>>", self._on_profile_mode_changed)
+        tb.Label(profile_bar, text="店铺:").pack(side=tk.LEFT, padx=2)
+        self._store_var = tk.StringVar()
+        self._store_cb = tb.Combobox(profile_bar, textvariable=self._store_var,
+                                     state="readonly", width=11)
+        self._store_cb.pack(side=tk.LEFT, padx=2)
+        self._store_cb.bind("<<ComboboxSelected>>", self._on_store_changed)
+        self._store_category_var = tk.StringVar()
+        self._category_name_to_id = {}
+        self._category_id_to_name = {}
+        self._profile_rule_var = tk.StringVar(value="类目: 逐商品匹配")
+        tb.Label(profile_bar, textvariable=self._profile_rule_var,
+                 foreground="#555555").pack(side=tk.LEFT, padx=6)
+        tb.Button(profile_bar, text="配置", command=self._open_store_settings,
+                  bootstyle="outline-secondary", width=5).pack(side=tk.LEFT, padx=3)
+        self._profile_status_var = tk.StringVar(value="店铺配置待确认")
+        tb.Label(profile_bar, textvariable=self._profile_status_var,
+                 foreground="#666666", width=21, anchor=tk.W).pack(side=tk.LEFT, padx=4)
+        self._refresh_store_profile_controls(cfg.get("store_id", ""))
+        self._update_profile_mode_ui()
 
     def _setup_main_area(self):
         pw = tb.Panedwindow(self.root, orient=tk.HORIZONTAL)
@@ -223,8 +275,19 @@ class UploaderApp:
     def _restore_state(self, state):
         """Restore uploader state from a saved session."""
         self.source_path = state.get("source_path", "")
-        self.template_path = state.get("template_path", "")
+        restored_template = state.get("template_path", "")
+        if restored_template and os.path.isfile(restored_template):
+            self.template_path = restored_template
         self.products = state.get("products", [])
+        for product in self.products:
+            if not hasattr(product, "store_id"):
+                product.store_id = ""
+            if not hasattr(product, "store_category_id"):
+                product.store_category_id = ""
+            if not hasattr(product, "source_main_img"):
+                product.source_main_img = getattr(product, "main_img", "")
+            if not hasattr(product, "brand"):
+                product.brand = ""
         # Update toolbar buttons
         if self.source_path:
             self._src_btn.configure(text=os.path.basename(self.source_path))
@@ -244,6 +307,13 @@ class UploaderApp:
         platform = state.get("platform")
         if platform in ("shein", "aliexpress"):
             self._platform_var.set(platform)
+        profile_mode = state.get("profile_mode")
+        if profile_mode in ("store", "template"):
+            self._profile_mode_var.set(
+                PROFILE_MODE_TEMPLATE if profile_mode == "template" else PROFILE_MODE_STORE)
+        self._refresh_store_profile_controls(state.get("store_id", ""))
+        self._update_profile_mode_ui()
+        self._profile_confirmed = state.get("profile_confirmed", True)
         # Restore stats
         saved_stats = state.get("stats", {})
         self._stats = {
@@ -378,6 +448,12 @@ class UploaderApp:
             prod.result["M"] = chosen_codes.get("gmarket", "")
             prod.result["K_path"] = chosen_path
             prod.result["K_zh"] = chosen_zh
+            store_id = self._effective_store_id()
+            matched_profile = best_category_for_text(
+                store_id, f"{chosen_zh} {chosen_path}", self._profile_data)
+            if store_id:
+                prod.store_id = store_id
+                prod.store_category_id = matched_profile
             prod.logs.append(f"{time.strftime('%H:%M:%S')} 手动换类目: {chosen_path} ({chosen_zh})")
             self.update_product_status(idx, prod)
             self._show_preview(prod)
@@ -479,9 +555,19 @@ class UploaderApp:
         cat = prod.result.get("K", "")
         esm = prod.result.get("L", "")
         gmk = prod.result.get("M", "")
+        store_fixed = {}
+        if self._uses_store_profile():
+            store_fixed = category_fields(
+                getattr(prod, "store_id", ""),
+                getattr(prod, "store_category_id", ""),
+                getattr(self, "_profile_data", None))
+        fixed_text = ""
+        if store_fixed.get("AL") or store_fixed.get("AM"):
+            fixed_text = f"  AL:{store_fixed.get('AL', '')}  AM:{store_fixed.get('AM', '')}"
         self._pv_fields["category"].configure(state="normal")
         self._pv_fields["category"].delete(0, tk.END)
-        self._pv_fields["category"].insert(0, f"{cat}  (ESM:{esm}  G:{gmk})")
+        self._pv_fields["category"].insert(
+            0, f"{cat}  (ESM:{esm}  G:{gmk}){fixed_text}")
         self._pv_fields["category"].configure(state="readonly")
 
         price = prod.result.get("O", prod.price)
@@ -858,6 +944,374 @@ class UploaderApp:
     # WAVE 4 — task-08: Settings Dialogs
     # ============================================================
 
+    def _current_store_id(self):
+        return getattr(self, "_store_name_to_id", {}).get(self._store_var.get(), "")
+
+    def _uses_store_profile(self):
+        mode_var = getattr(self, "_profile_mode_var", None)
+        return mode_var is None or mode_var.get() == PROFILE_MODE_STORE
+
+    def _effective_store_id(self):
+        return self._current_store_id() if self._uses_store_profile() else ""
+
+    def _current_store_category_id(self):
+        return ""
+
+    def _update_profile_mode_ui(self):
+        if self._uses_store_profile():
+            self._store_cb.configure(state="readonly")
+            self._profile_rule_var.set("类目: 逐商品匹配")
+            if self._current_store_id():
+                self._profile_status_var.set(
+                    f"店铺模式：{self._store_var.get()}；类目逐商品自动匹配")
+            else:
+                self._profile_status_var.set("店铺模式：请选择店铺")
+        else:
+            self._store_cb.configure(state="disabled")
+            self._profile_rule_var.set("代码: 模板第 8 行")
+            self._profile_status_var.set("旧模板模式：固定值取自所选模板第 8 行")
+
+    def _on_profile_mode_changed(self, event=None):
+        cfg = load_config()
+        cfg["profile_mode"] = "store" if self._uses_store_profile() else "template"
+        save_config(cfg)
+        for product in getattr(self, "products", []):
+            product.store_id = ""
+            product.store_category_id = ""
+        self._profile_confirmed = not self._uses_store_profile()
+        self._update_profile_mode_ui()
+        if self._uses_store_profile() and getattr(self, "source_path", None) and getattr(self, "products", []):
+            self._start_profile_detection()
+
+    def _refresh_store_profile_controls(self, preferred_store_id="", preferred_category_id=""):
+        self._profile_data = load_store_profiles()
+        stores = self._profile_data.get("stores", [])
+        self._store_name_to_id = {store["name"]: store["id"] for store in stores}
+        self._store_id_to_name = {store["id"]: store["name"] for store in stores}
+        self._store_cb.configure(values=list(self._store_name_to_id))
+        if preferred_store_id in self._store_id_to_name:
+            self._store_var.set(self._store_id_to_name[preferred_store_id])
+        elif self._store_var.get() not in self._store_name_to_id:
+            self._store_var.set("")
+        self._store_category_var.set("")
+
+    def _save_profile_selection(self):
+        cfg = load_config()
+        cfg["store_id"] = self._current_store_id()
+        cfg["profile_mode"] = "store" if self._uses_store_profile() else "template"
+        cfg.pop("store_category_id", None)
+        save_config(cfg)
+
+    def _on_store_changed(self, event=None):
+        store_id = self._current_store_id()
+        for product in getattr(self, "products", []):
+            product.store_id = store_id
+            product.store_category_id = ""
+        self._profile_confirmed = True
+        self._profile_status_var.set(
+            f"已确认店铺：{self._store_var.get()}；类目将逐商品自动匹配")
+        self._save_profile_selection()
+
+    def _apply_profile_suggestion(self, suggestion):
+        if not self._uses_store_profile():
+            self._update_profile_mode_ui()
+            return
+        store_id = suggestion.get("store_id", "")
+        if store_id:
+            self._refresh_store_profile_controls(store_id)
+        method = "DeepSeek" if suggestion.get("method") == "deepseek" else "规则"
+        confidence = float(suggestion.get("confidence", 0) or 0)
+        if store_id and confidence >= 0.75:
+            self._profile_confirmed = True
+            self._profile_status_var.set(
+                f"{method}识别店铺：{self._store_var.get()}；类目将逐商品自动匹配")
+            for product in self.products:
+                product.store_id = store_id
+                product.store_category_id = ""
+            self._save_profile_selection()
+        else:
+            self._profile_confirmed = False
+            detail = suggestion.get("error") or "证据不足"
+            self._profile_status_var.set(f"自动识别未确认：{detail[:60]}，请手动选择")
+
+    def _start_profile_detection(self):
+        if not self._uses_store_profile():
+            self._profile_confirmed = True
+            self._update_profile_mode_ui()
+            return
+        self._profile_confirmed = False
+        self._profile_status_var.set("正在分析采集表对应的店铺...")
+        rule_result = suggest_source_profile(
+            self.source_path, self.products, self._profile_data, use_ai=False)
+        if rule_result.get("store_id") and float(rule_result.get("confidence", 0) or 0) >= 0.75:
+            self._apply_profile_suggestion(rule_result)
+            return
+
+        def worker():
+            result = suggest_source_profile(
+                self.source_path, self.products, self._profile_data, use_ai=True)
+            self.root.after(0, lambda: self._apply_profile_suggestion(result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _parse_extra_fields(text):
+        fields = {}
+        for line in str(text or "").splitlines():
+            if not line.strip() or "=" not in line:
+                continue
+            column, value = line.split("=", 1)
+            column = column.strip().upper()
+            value = value.strip()
+            if re.fullmatch(r"[A-Z]{1,2}", column) and value:
+                fields[column] = value
+        return fields
+
+    @staticmethod
+    def _format_extra_fields(fields, excluded):
+        return "\n".join(
+            f"{column}={value}" for column, value in sorted(fields.items())
+            if column not in excluded
+        )
+
+    def _open_store_settings(self):
+        data = load_store_profiles()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("店铺和类目设置")
+        dlg.geometry("760x700")
+        dlg.minsize(700, 650)
+        dlg.transient(self.root)
+
+        top = tb.Frame(dlg, padding=10)
+        top.pack(fill=tk.X)
+        tb.Label(top, text="店铺:").pack(side=tk.LEFT)
+        store_var = tk.StringVar(value=self._current_store_id())
+        store_cb = tb.Combobox(top, textvariable=store_var, state="readonly", width=18)
+        store_cb.pack(side=tk.LEFT, padx=4)
+        tb.Button(top, text="新增店铺", command=lambda: _new_store()).pack(side=tk.LEFT, padx=3)
+        tb.Button(top, text="删除店铺", command=lambda: _delete_store(),
+                  bootstyle="outline-danger").pack(side=tk.LEFT, padx=3)
+        tb.Button(top, text="从旧模板导入", command=lambda: _import_template(),
+                  bootstyle="outline-primary").pack(side=tk.RIGHT, padx=3)
+
+        store_frame = tb.LabelFrame(dlg, text="店铺基础固定字段")
+        store_frame.pack(fill=tk.X, padx=10, pady=4)
+        store_name_var = tk.StringVar()
+        store_alias_var = tk.StringVar()
+        base_vars = {column: tk.StringVar() for column in ("C", "D", "AE", "AF", "AG", "AH", "AI")}
+        base_labels = [
+            ("名称", store_name_var), ("采集表店铺标识（可选）", store_alias_var),
+            ("C  Auction ID", base_vars["C"]), ("D  Gmarket ID", base_vars["D"]),
+            ("AE 出货地代码", base_vars["AE"]), ("AF 配送政策编号", base_vars["AF"]),
+            ("AG 退换货地址", base_vars["AG"]), ("AH Auction发货政策", base_vars["AH"]),
+            ("AI Gmarket发货政策", base_vars["AI"]),
+        ]
+        for index, (label, variable) in enumerate(base_labels):
+            row, column = divmod(index, 2)
+            tb.Label(store_frame, text=label).grid(row=row, column=column * 2, sticky=tk.W, padx=4, pady=3)
+            tb.Entry(store_frame, textvariable=variable, width=25).grid(
+                row=row, column=column * 2 + 1, sticky=tk.EW, padx=4, pady=3)
+        store_frame.columnconfigure(1, weight=1)
+        store_frame.columnconfigure(3, weight=1)
+        tb.Label(store_frame, text="其他店铺固定列（每行：列=值）").grid(
+            row=5, column=0, columnspan=2, sticky=tk.NW, padx=4, pady=3)
+        base_other = tk.Text(store_frame, height=2, width=36)
+        base_other.grid(row=5, column=2, columnspan=2, sticky=tk.EW, padx=4, pady=3)
+
+        category_top = tb.Frame(dlg, padding=(10, 8, 10, 0))
+        category_top.pack(fill=tk.X)
+        tb.Label(category_top, text="店铺类目:").pack(side=tk.LEFT)
+        category_var = tk.StringVar()
+        category_cb = tb.Combobox(category_top, textvariable=category_var,
+                                  state="readonly", width=22)
+        category_cb.pack(side=tk.LEFT, padx=4)
+        tb.Button(category_top, text="新增类目", command=lambda: _new_category()).pack(side=tk.LEFT, padx=3)
+        tb.Button(category_top, text="删除类目", command=lambda: _delete_category(),
+                  bootstyle="outline-danger").pack(side=tk.LEFT, padx=3)
+
+        category_frame = tb.LabelFrame(dlg, text="店铺 + 类目固定字段")
+        category_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        category_name_var = tk.StringVar()
+        category_vars = {column: tk.StringVar() for column in ("AL", "AM", "J", "AC")}
+        category_labels = [
+            ("名称", category_name_var), ("AL 商品群代码", category_vars["AL"]),
+            ("AM 商品告知模板", category_vars["AM"]), ("J 类目模板代码", category_vars["J"]),
+            ("AC 配送模板代码", category_vars["AC"]),
+        ]
+        for index, (label, variable) in enumerate(category_labels):
+            row, column = divmod(index, 2)
+            tb.Label(category_frame, text=label).grid(row=row, column=column * 2, sticky=tk.W, padx=4, pady=3)
+            tb.Entry(category_frame, textvariable=variable, width=25).grid(
+                row=row, column=column * 2 + 1, sticky=tk.EW, padx=4, pady=3)
+        category_frame.columnconfigure(1, weight=1)
+        category_frame.columnconfigure(3, weight=1)
+        tb.Label(category_frame, text="其他类目固定列（认证等，每行：列=值）").grid(
+            row=4, column=0, columnspan=2, sticky=tk.NW, padx=4, pady=3)
+        category_other = tk.Text(category_frame, height=3, width=36)
+        category_other.grid(row=4, column=2, columnspan=2, sticky=tk.NSEW, padx=4, pady=3)
+        category_frame.rowconfigure(4, weight=1)
+
+        def _aliases(text):
+            return [item.strip() for item in re.split(r"[,，;；]+", text) if item.strip()]
+
+        def _current_store():
+            return find_store(data, store_var.get())
+
+        def _current_category():
+            return find_category(_current_store(), category_var.get())
+
+        def _reload_store_values(preferred=""):
+            values = [store["id"] for store in data.get("stores", [])]
+            store_cb.configure(values=values)
+            if preferred in values:
+                store_var.set(preferred)
+            elif values and store_var.get() not in values:
+                store_var.set(values[0])
+            elif not values:
+                store_var.set("")
+            _load_store()
+
+        def _load_store(event=None):
+            store = _current_store()
+            store_name_var.set(store.get("name", "") if store else "")
+            store_alias_var.set(", ".join(store.get("aliases", [])) if store else "")
+            for column, variable in base_vars.items():
+                variable.set(str(store.get("fields", {}).get(column, "")) if store else "")
+            base_other.delete("1.0", tk.END)
+            if store:
+                base_other.insert("1.0", self._format_extra_fields(
+                    store.get("fields", {}), set(base_vars)))
+            categories = store.get("categories", []) if store else []
+            values = [category["id"] for category in categories]
+            category_cb.configure(values=values)
+            if category_var.get() not in values:
+                category_var.set(values[0] if values else "")
+            _load_category()
+
+        def _load_category(event=None):
+            category = _current_category()
+            category_name_var.set(category.get("name", "") if category else "")
+            for column, variable in category_vars.items():
+                variable.set(str(category.get("fields", {}).get(column, "")) if category else "")
+            category_other.delete("1.0", tk.END)
+            if category:
+                category_other.insert("1.0", self._format_extra_fields(
+                    category.get("fields", {}), set(category_vars)))
+
+        def _save_current(show_message=True):
+            store = _current_store()
+            if not store:
+                return False
+            store["name"] = store_name_var.get().strip() or store["id"]
+            store["aliases"] = _aliases(store_alias_var.get())
+            fields = self._parse_extra_fields(base_other.get("1.0", tk.END))
+            for column, variable in base_vars.items():
+                if variable.get().strip():
+                    fields[column] = variable.get().strip()
+            store["fields"] = fields
+            category = _current_category()
+            if category:
+                category["name"] = category_name_var.get().strip() or category["id"]
+                cat_fields = self._parse_extra_fields(category_other.get("1.0", tk.END))
+                for column, variable in category_vars.items():
+                    if variable.get().strip():
+                        cat_fields[column] = variable.get().strip()
+                category["fields"] = cat_fields
+            saved = save_store_profiles(data)
+            data.clear()
+            data.update(saved)
+            self._refresh_store_profile_controls(store["id"], category["id"] if category else "")
+            if show_message:
+                messagebox.showinfo("提示", "店铺和类目配置已保存", parent=dlg)
+            return True
+
+        def _safe_id(value, fallback):
+            value = re.sub(r"[^0-9a-zA-Z_]+", "_", value).strip("_").lower()
+            return value or fallback
+
+        def _new_store():
+            name = simpledialog.askstring("新增店铺", "店铺名称或编号：", parent=dlg)
+            if not name:
+                return
+            store_id = _safe_id(name, f"store_{len(data['stores']) + 1}")
+            if find_store(data, store_id):
+                messagebox.showerror("提示", "该店铺编号已存在", parent=dlg)
+                return
+            data["stores"].append({
+                "id": store_id, "name": name.strip(), "aliases": [name.strip()],
+                "fields": {}, "categories": [],
+            })
+            _reload_store_values(store_id)
+
+        def _delete_store():
+            store = _current_store()
+            if not store or not messagebox.askyesno(
+                    "确认", f"删除店铺 {store['name']} 及其全部类目？", parent=dlg):
+                return
+            data["stores"] = [item for item in data["stores"] if item["id"] != store["id"]]
+            _reload_store_values()
+
+        def _new_category():
+            store = _current_store()
+            if not store:
+                messagebox.showinfo("提示", "请先新增店铺", parent=dlg)
+                return
+            name = simpledialog.askstring("新增类目", "类目名称：", parent=dlg)
+            if not name:
+                return
+            category_id = _safe_id(name, f"category_{len(store['categories']) + 1}")
+            existing = {item["id"] for item in store["categories"]}
+            suffix = 2
+            base = category_id
+            while category_id in existing:
+                category_id = f"{base}_{suffix}"
+                suffix += 1
+            store["categories"].append({
+                "id": category_id, "name": name.strip(), "fields": {},
+            })
+            category_var.set(category_id)
+            _load_store()
+            category_var.set(category_id)
+            _load_category()
+
+        def _delete_category():
+            store = _current_store()
+            category = _current_category()
+            if not store or not category or not messagebox.askyesno(
+                    "确认", f"删除类目 {category['name']}？", parent=dlg):
+                return
+            store["categories"] = [
+                item for item in store["categories"] if item["id"] != category["id"]]
+            category_var.set("")
+            _load_store()
+
+        def _import_template():
+            nonlocal data
+            path = filedialog.askopenfilename(
+                title="选择旧上架模板", filetypes=[("Excel", "*.xlsx")], parent=dlg)
+            if not path:
+                return
+            try:
+                data, store_id, category_id = import_template_profile(path, data)
+                save_store_profiles(data)
+                _reload_store_values(store_id)
+                category_var.set(category_id)
+                _load_category()
+                messagebox.showinfo(
+                    "导入完成", "已读取模板第 8 行，并拆分为店铺字段和店铺类目字段。",
+                    parent=dlg)
+            except Exception as exc:
+                messagebox.showerror("导入失败", str(exc), parent=dlg)
+
+        store_cb.bind("<<ComboboxSelected>>", _load_store)
+        category_cb.bind("<<ComboboxSelected>>", _load_category)
+        bottom = tb.Frame(dlg, padding=10)
+        bottom.pack(fill=tk.X)
+        tb.Button(bottom, text="保存配置", command=_save_current,
+                  bootstyle="success").pack(side=tk.RIGHT, padx=4)
+        tb.Button(bottom, text="关闭", command=dlg.destroy).pack(side=tk.RIGHT, padx=4)
+        _reload_store_values(store_var.get())
+
     def _on_img_api_changed(self, event=None):
         """Save image API choice to config when dropdown changes."""
         cfg = load_config()
@@ -1186,44 +1640,15 @@ ParentSKU 并跳过，只处理剩余的。
         if not path:
             return
         try:
-            from openpyxl import load_workbook
-            wb = load_workbook(path, read_only=True)
-            ws = wb.active
-            rows = ws.iter_rows(min_row=2, values_only=True)
+            from processor import load_products
             existing = {p.parent_sku for p in self.products}
-            from models import Product
-            new_groups = {}
-            for row in rows:
-                if not row[0]:
-                    continue
-                psku = str(row[0])
-                if psku in existing:
-                    continue  # skip duplicates
-                if psku not in new_groups:
-                    new_groups[psku] = Product(
-                        parent_sku=psku,
-                        title=str(row[2] or ""),
-                        tag=str(row[4] or ""),
-                        price=str(row[12] or ""),
-                        url=str(row[11] or ""),
-                        main_img=str(row[17] or ""),
-                    )
-                color = str(row[9] or "")
-                size = str(row[10] or "")
-                price = str(row[12] or "")
-                if color and color != "Default" and color not in new_groups[psku].colors:
-                    new_groups[psku].colors.append(color)
-                if size and size != "One Size" and size not in new_groups[psku].sizes:
-                    new_groups[psku].sizes.append(size)
-                new_groups[psku].color_sizes.append((color, size, price))
-                vi = str(row[40] or "")
-                if vi and vi not in new_groups[psku].variant_imgs:
-                    new_groups[psku].variant_imgs.append(vi)
-                for i in range(17, 38):
-                    u = str(row[i] or "")
-                    if u and u.startswith("http") and u not in new_groups[psku].extra_imgs:
-                        new_groups[psku].extra_imgs.append(u)
-            new_list = list(new_groups.values())
+            platform = self._platform_var.get()
+            loaded = load_products(path, platform)
+            new_list = [product for product in loaded if product.parent_sku not in existing]
+            store_id = self._effective_store_id()
+            for product in new_list:
+                product.store_id = store_id
+                product.store_category_id = ""
             if new_list:
                 self.products.extend(new_list)
                 self._refresh_list()
@@ -1245,63 +1670,18 @@ ParentSKU 并跳过，只处理剩余的。
             return
         try:
             platform = self._platform_var.get()
-            from openpyxl import load_workbook
-            wb = load_workbook(self.source_path, read_only=True)
-            ws = wb.active
-            rows = ws.iter_rows(min_row=2, values_only=True)
-            from models import Product
-            groups = {}
-            for row in rows:
-                if not row[0]:
-                    continue
-                psku = str(row[0])
-                if psku not in groups:
-                    groups[psku] = Product(
-                        parent_sku=psku,
-                        title=str(row[2] or ""),
-                        tag=str(row[4] or ""),
-                        price=str(row[12] or ""),
-                        url=str(row[11] or ""),
-                        main_img=str(row[17] or ""),
-                        platform=platform,
-                    )
-                color = str(row[9] or "")
-                size = str(row[10] or "")
-                price = str(row[12] or "")
-                if color and color != "Default" and color not in groups[psku].colors:
-                    groups[psku].colors.append(color)
-                if size and size != "One Size" and size not in groups[psku].sizes:
-                    groups[psku].sizes.append(size)
-                groups[psku].color_sizes.append((color, size, price))
-                vi = str(row[40] or "")
-                if vi and vi not in groups[psku].variant_imgs:
-                    groups[psku].variant_imgs.append(vi)
-                for i in range(17, 38):
-                    u = str(row[i] or "")
-                    if u and u.startswith("http") and u not in groups[psku].extra_imgs:
-                        groups[psku].extra_imgs.append(u)
-                # AliExpress: read description images from cols 67-86
-                if platform == "aliexpress":
-                    for i in range(66, 86):
-                        u = str(row[i] or "") if i < len(row) else ""
-                        if u and u.startswith("http") and u not in groups[psku].desc_images:
-                            groups[psku].desc_images.append(u)
-            # Dedup (color,size) combos
-            for p in groups.values():
-                seen, deduped = set(), []
-                for cs in p.color_sizes:
-                    key = (cs[0], cs[1])
-                    if key not in seen:
-                        seen.add(key)
-                        deduped.append(cs)
-                p.color_sizes = deduped
-            self.products = list(groups.values())
+            from processor import load_products
+            self.products = load_products(self.source_path, platform)
             # Store original main_img for platform switching
-            self._orig_main_img = {p.parent_sku: p.main_img for p in self.products}
+            self._orig_main_img = {
+                p.parent_sku: getattr(p, "source_main_img", "") or p.main_img
+                for p in self.products
+            }
             # Apply initial platform setting
             self._apply_platform_images()
             self._refresh_list()
             messagebox.showinfo("提示", f"已加载 {len(self.products)} 个产品")
+            self._start_profile_detection()
         except Exception as e:
             messagebox.showerror("加载失败", str(e))
 
@@ -1468,6 +1848,9 @@ ParentSKU 并跳过，只处理剩余的。
 
         errors = []
         lock = threading.Lock()
+        store_id = self._effective_store_id()
+        profile_data = load_store_profiles()
+        store_category_cache = {}
 
         def worker(idx, prod):
             try:
@@ -1477,13 +1860,29 @@ ParentSKU 并跳过，只处理剩余的。
 
                 prod.status = ProductStatus.PHASE1_CATEGORY
                 self.root.after(0, lambda i=idx, p=prod: self.update_product_status(i, p))
-                cat_path, k, l, m = phase1_category(prod, categories, prompt_key)
+                cat_path, k, l, m = phase1_category(prod, categories)
                 ensure_upload_category_codes(k, l, m)
                 prod.result["K"] = k
                 prod.result["L"] = l
                 prod.result["M"] = m
                 prod.result["K_path"] = cat_path
                 prod.result["K_zh"] = _get_category_zh(cat_path)
+                if store_id:
+                    cache_key = cat_path or f"{k}|{l}|{m}"
+                    with lock:
+                        store_match = store_category_cache.get(cache_key)
+                        if store_match is None:
+                            store_match = match_store_category(
+                                store_id, prod, cat_path, prod.result["K_zh"],
+                                profile_data, use_ai=True)
+                            store_category_cache[cache_key] = store_match
+                    category_id = store_match.get("category_id", "")
+                    fixed = category_fields(store_id, category_id, profile_data)
+                    if not category_id or not fixed.get("AL") or not fixed.get("AM"):
+                        raise ValueError(
+                            f"店铺类目固定代码匹配失败：{prod.result['K_zh'] or cat_path}")
+                    prod.store_id = store_id
+                    prod.store_category_id = category_id
 
                 prod.status = ProductStatus.PHASE1_PRICE
                 prod.result["O"] = prod.result.get("O") or phase1_price(prod, self.products, cfg)
@@ -1537,6 +1936,21 @@ ParentSKU 并跳过，只处理剩余的。
         if not self.template_path:
             messagebox.showinfo("提示", "请先选择上架表模板")
             return
+        store_id = self._effective_store_id()
+        if self._uses_store_profile() and not store_id:
+            messagebox.showerror("无法导出", "当前为按店铺配置模式，请先选择店铺")
+            return
+        missing_profiles = [
+            product.parent_sku for product in self.products
+            if product.status == ProductStatus.DONE
+            and store_id and not getattr(product, "store_category_id", "")
+        ]
+        if missing_profiles:
+            messagebox.showerror(
+                "无法导出",
+                "以下产品尚未逐商品匹配 AL/AM，请重新处理：\n" +
+                "\n".join(missing_profiles[:10]))
+            return
 
         path = filedialog.asksaveasfilename(
             title="导出上架表", defaultextension=".xlsx",
@@ -1553,10 +1967,14 @@ ParentSKU 并跳过，只处理剩余的。
             twb = load_workbook(path)
             tws = twb["NEW 일반상품"]
             from processor import write_product_row, init_output_workbook
-            _, _, fixed = init_output_workbook(self.template_path, path)
+            _, _, fixed = init_output_workbook(
+                self.template_path, path, store_id=store_id)
             for i, prod in enumerate(self.products):
                 if prod.status == ProductStatus.DONE:
-                    write_product_row(tws, i, prod, fixed, 8)
+                    selected_category = getattr(prod, "store_category_id", "")
+                    write_product_row(
+                        tws, i, prod, fixed, 8,
+                        category_fields(store_id, selected_category, self._profile_data))
             twb.save(path)
             messagebox.showinfo("提示", f"已导出 {len([p for p in self.products if p.status == ProductStatus.DONE])} 个产品到:\n{path}")
         except Exception as e:
@@ -1575,6 +1993,9 @@ ParentSKU 并跳过，只处理剩余的。
             "img_profile": self._img_profile_var.get(),
             "title_mode": self._title_mode_var.get(),
             "platform": self._platform_var.get(),
+            "store_id": self._current_store_id(),
+            "profile_mode": "store" if self._uses_store_profile() else "template",
+            "profile_confirmed": self._profile_confirmed,
             "mode": self._mode_var.get(),
             "stats": self._stats,
         }
@@ -1629,6 +2050,26 @@ ParentSKU 并跳过，只处理剩余的。
         if not self.products:
             messagebox.showinfo("提示", "采集表无产品，请重新选择")
             return
+        store_id = self._effective_store_id()
+        if self._uses_store_profile() and not store_id:
+            messagebox.showerror("未选择店铺", "当前为按店铺配置模式，请先选择店铺")
+            return
+        if store_id:
+            profile_errors = validate_store_profile(store_id, self._profile_data)
+            if profile_errors:
+                messagebox.showerror(
+                    "店铺配置不完整", "请先修正以下配置：\n\n" + "\n".join(profile_errors))
+                return
+        if store_id and not self._profile_confirmed:
+            if not messagebox.askyesno(
+                    "确认店铺配置",
+                    f"自动识别的店铺尚未确认：\n{self._store_var.get()}\n\n确认使用？"):
+                return
+            self._profile_confirmed = True
+        for product in self.products:
+            product.store_id = store_id
+            if product.status != ProductStatus.DONE:
+                product.store_category_id = ""
         mode = messagebox.askyesnocancel("运行模式",
                                          "选择运行模式:\n\n是 = 全自动运行\n否 = 错误确认模式\n取消 = 返回")
         if mode is None:
@@ -1642,7 +2083,10 @@ ParentSKU 并跳过，只处理剩余的。
 
         # Build output path
         date_str = time.strftime("%Y%m%d")
-        tpl_stem = os.path.splitext(os.path.basename(self.template_path))[0]
+        if store_id:
+            tpl_stem = f"{self._store_var.get()}上架表格-混合类目"
+        else:
+            tpl_stem = os.path.splitext(os.path.basename(self.template_path))[0]
         cfg = load_config()
         base_dir = cfg.get("save_dir") or os.path.dirname(self.source_path)
         counter = 1
@@ -1686,7 +2130,8 @@ ParentSKU 并跳过，只处理剩余的。
 
         self._pipeline = ProcessingPipeline(
             self.source_path, self.template_path, output_path,
-            prompt_key, mode, progress_cb, stat_cb, error_cb)
+            prompt_key, mode, progress_cb, stat_cb, error_cb,
+            store_id=store_id)
 
         # Run in background thread
         self._mode_var.set("处理中...")

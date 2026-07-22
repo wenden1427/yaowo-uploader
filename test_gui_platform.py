@@ -2,7 +2,7 @@ import unittest
 import inspect
 
 import gui
-from gui import UploaderApp
+from gui import PROFILE_MODE_STORE, PROFILE_MODE_TEMPLATE, UploaderApp
 from models import Product
 
 
@@ -12,6 +12,9 @@ class FakeVar:
 
     def get(self):
         return self.value
+
+    def set(self, value):
+        self.value = value
 
 
 class FakeTree:
@@ -37,6 +40,14 @@ class FakeStyle:
 
     def theme_use(self, name):
         self.theme = name
+
+
+class FakeCombo:
+    def __init__(self):
+        self.options = {}
+
+    def configure(self, **kwargs):
+        self.options.update(kwargs)
 
 
 class FakeRoot:
@@ -125,6 +136,71 @@ class PlatformSwitchTests(unittest.TestCase):
         self.assertIn("AI重写", source)
         self.assertIn("仅去品牌", source)
         self.assertIn("title_mode", source)
+
+    def test_store_selection_clears_product_category_and_persists(self):
+        app = UploaderApp.__new__(UploaderApp)
+        product = Product(parent_sku="P1")
+        product.store_category_id = "old_category"
+        app.products = [product]
+        app._store_var = FakeVar("T66")
+        app._profile_status_var = FakeVar("")
+        app._store_name_to_id = {"T66": "t66"}
+        saved = []
+        gui.load_config = lambda: {"platform": "shein"}
+        gui.save_config = lambda cfg: saved.append(dict(cfg))
+
+        app._on_store_changed()
+
+        self.assertEqual(product.store_id, "t66")
+        self.assertEqual(product.store_category_id, "")
+        self.assertTrue(app._profile_confirmed)
+        self.assertIn("T66", app._profile_status_var.get())
+        self.assertIn("逐商品自动匹配", app._profile_status_var.get())
+        self.assertEqual(saved[-1]["store_id"], "t66")
+        self.assertNotIn("store_category_id", saved[-1])
+
+    def test_old_template_mode_ignores_selected_store(self):
+        app = UploaderApp.__new__(UploaderApp)
+        app._profile_mode_var = FakeVar(PROFILE_MODE_TEMPLATE)
+        app._store_var = FakeVar("T66")
+        app._store_name_to_id = {"T66": "t66"}
+
+        self.assertFalse(app._uses_store_profile())
+        self.assertEqual(app._effective_store_id(), "")
+
+    def test_profile_mode_change_persists_and_clears_product_mapping(self):
+        app = UploaderApp.__new__(UploaderApp)
+        product = Product(parent_sku="P1")
+        product.store_id = "t66"
+        product.store_category_id = "bags"
+        app.products = [product]
+        app.source_path = ""
+        app._profile_mode_var = FakeVar(PROFILE_MODE_TEMPLATE)
+        app._store_var = FakeVar("T66")
+        app._store_name_to_id = {"T66": "t66"}
+        app._store_cb = FakeCombo()
+        app._profile_status_var = FakeVar("")
+        app._profile_rule_var = FakeVar("")
+        saved = []
+        gui.load_config = lambda: {"platform": "shein"}
+        gui.save_config = lambda cfg: saved.append(dict(cfg))
+
+        app._on_profile_mode_changed()
+
+        self.assertEqual(product.store_id, "")
+        self.assertEqual(product.store_category_id, "")
+        self.assertEqual(app._store_cb.options["state"], "disabled")
+        self.assertIn("第 8 行", app._profile_status_var.get())
+        self.assertEqual(saved[-1]["profile_mode"], "template")
+
+    def test_store_profile_mode_uses_selected_store(self):
+        app = UploaderApp.__new__(UploaderApp)
+        app._profile_mode_var = FakeVar(PROFILE_MODE_STORE)
+        app._store_var = FakeVar("T66")
+        app._store_name_to_id = {"T66": "t66"}
+
+        self.assertTrue(app._uses_store_profile())
+        self.assertEqual(app._effective_store_id(), "t66")
 
     def test_theme_change_saves_config(self):
         app = UploaderApp.__new__(UploaderApp)

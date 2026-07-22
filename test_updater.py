@@ -1,7 +1,9 @@
 import os
+import tempfile
 import unittest
 
 import updater
+import main as uploader_main
 
 
 class UpdaterVersionTests(unittest.TestCase):
@@ -129,6 +131,54 @@ class UpdaterVersionTests(unittest.TestCase):
             updater._get_remote_commit_sha = orig_remote_sha
             updater.messagebox.askyesno = orig_ask
             updater._do_update = orig_update
+
+
+class UpdaterCopyTests(unittest.TestCase):
+    def test_copy_update_tree_updates_nested_assets_and_preserves_user_files(self):
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as target:
+            os.makedirs(os.path.join(source, "uploader"))
+            os.makedirs(os.path.join(source, "python-portable"))
+            with open(os.path.join(source, "gui.py"), "w", encoding="utf-8") as handle:
+                handle.write("new gui")
+            with open(os.path.join(source, "store_profiles.yaml"), "w", encoding="utf-8") as handle:
+                handle.write("repository defaults")
+            with open(os.path.join(source, "uploader", "template.xlsx"), "wb") as handle:
+                handle.write(b"new template")
+            with open(os.path.join(source, "python-portable", "python.exe"), "wb") as handle:
+                handle.write(b"do not copy")
+            with open(os.path.join(target, "store_profiles.yaml"), "w", encoding="utf-8") as handle:
+                handle.write("user settings")
+
+            updater._copy_update_tree(source, target)
+
+            with open(os.path.join(target, "gui.py"), encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "new gui")
+            with open(os.path.join(target, "store_profiles.yaml"), encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "user settings")
+            with open(os.path.join(target, "uploader", "template.xlsx"), "rb") as handle:
+                self.assertEqual(handle.read(), b"new template")
+            self.assertFalse(os.path.exists(os.path.join(target, "python-portable", "python.exe")))
+
+
+class BundledTemplateTests(unittest.TestCase):
+    def test_startup_syncs_template_delivered_by_legacy_updater(self):
+        original_skill_dir = uploader_main.SKILL_DIR
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                uploader_main.SKILL_DIR = temp_dir
+                os.makedirs(os.path.join(temp_dir, "uploader"))
+                source = os.path.join(temp_dir, "default_template.xlsx")
+                destination = os.path.join(temp_dir, "uploader", "韩国上传模板.xlsx")
+                with open(source, "wb") as handle:
+                    handle.write(b"new template")
+                with open(destination, "wb") as handle:
+                    handle.write(b"old template")
+
+                self.assertIsNone(uploader_main.sync_bundled_template())
+                with open(destination, "rb") as handle:
+                    self.assertEqual(handle.read(), b"new template")
+        finally:
+            uploader_main.SKILL_DIR = original_skill_dir
 
 
 if __name__ == "__main__":

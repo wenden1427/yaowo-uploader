@@ -4,9 +4,35 @@
 
 import sys
 import os
+import hashlib
+import shutil
 import tkinter.messagebox as mb
 
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sync_bundled_template():
+    """Install the universal template delivered by legacy top-level updaters."""
+    source = os.path.join(SKILL_DIR, "default_template.xlsx")
+    destination = os.path.join(SKILL_DIR, "uploader", "韩国上传模板.xlsx")
+    if not os.path.isfile(source):
+        return None
+    try:
+        if os.path.isfile(destination) and _file_sha256(source) == _file_sha256(destination):
+            return None
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        shutil.copy2(source, destination)
+        return None
+    except Exception as exc:
+        return str(exc)
 
 
 def check_python_version() -> bool:
@@ -62,8 +88,11 @@ def main():
     if not check_modules():
         sys.exit(1)
 
+    template_sync_error = sync_bundled_template()
     file_status = check_files()
     warnings = []
+    if template_sync_error:
+        warnings.append(f"通用模板更新失败: {template_sync_error}")
     names = {"template": "上架模板 (韩国上传模板.xlsx)",
              "category": "类目代码表 (카테고리목록.xls)",
              "banned": "违禁词 (违禁词gmk.txt)"}

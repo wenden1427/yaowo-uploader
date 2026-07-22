@@ -28,15 +28,19 @@ class Product:
     title: str = ""
     ai_title: str = ""
     tag: str = ""
+    brand: str = ""
     colors: list[str] = field(default_factory=list)
     sizes: list[str] = field(default_factory=list)
     color_sizes: list[tuple] = field(default_factory=list)
     main_img: str = ""
+    source_main_img: str = ""
     extra_imgs: list[str] = field(default_factory=list)
     variant_imgs: list[str] = field(default_factory=list)
     desc_images: list[str] = field(default_factory=list)
     ai_source_image_url: str = ""
     platform: str = "shein"
+    store_id: str = ""
+    store_category_id: str = ""
     price: str = ""
     url: str = ""
     status: ProductStatus = ProductStatus.PENDING
