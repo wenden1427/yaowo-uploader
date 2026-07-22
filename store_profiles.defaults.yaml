@@ -1,0 +1,14 @@
+version: 1
+global_fields:
+  B: 옥션/G마켓
+  N: 무제한
+  U: '100'
+  V: '100'
+  AD: 일반택배
+  AJ: '10013'
+  AK: '0'
+  BA: 해당없음
+  BB: 해외수입
+  BD: 단일원산지
+  BK: 과세상품
+stores: []
