@@ -3,6 +3,7 @@ import io
 import json
 import unittest
 import urllib.error
+from unittest import mock
 
 import api_client
 
@@ -106,6 +107,17 @@ class RouteApiTests(unittest.TestCase):
 
         self.assertEqual(result, b"ok")
         self.assertEqual(calls, [("make it clean", ["http://example.com/a.jpg"], "gpt-image-2-1k", "1024x1024")])
+
+    def test_make_opener_uses_explicit_direct_and_proxy_routes(self):
+        sent_routes = []
+        sentinel = object()
+        with mock.patch(
+            "network_utils.build_network_opener",
+            side_effect=lambda route: sent_routes.append(route) or sentinel,
+        ):
+            self.assertIs(api_client._make_opener(False), sentinel)
+            self.assertIs(api_client._make_opener(True), sentinel)
+        self.assertEqual(sent_routes, ["direct", "proxy"])
 
     def test_routeapi_generate_sends_multipart_edit_request(self):
         opener = FakeOpener()

@@ -1356,7 +1356,7 @@ class UploaderApp:
             ("Cloudinary Cloud Name:", "cloud_name", storage.get("cloud_name", ""), False),
             ("Cloudinary API Key:", "api_key", storage.get("api_key", ""), True),
             ("Cloudinary API Secret:", "api_secret", storage.get("api_secret", ""), True),
-            ("代理地址 (留空=自动):", "proxy", cfg.get("proxy", ""), False),
+            ("显式代理 (留空=跟随系统/TUN):", "proxy", cfg.get("proxy", ""), False),
         ]
         entries = {}
         for i, (label, key, val, secret) in enumerate(fields):
@@ -1588,7 +1588,7 @@ class UploaderApp:
 ## 第一步：配置 API
 点击菜单 设置 → API 配置。必填项：DeepSeek Key。
 routeapi Key 和 Cloudinary 配置用于生图和图片上传。
-代理地址留空则自动检测系统代理。
+显式代理留空时，自动跟随当前 Windows 系统代理；没有系统代理时兼容直连或 TUN。
 
 ## 第二步：选择文件
 工具栏点击采集表（采集器输出的 Excel）和模板（Gmarket 上架表模板）。

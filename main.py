@@ -81,7 +81,7 @@ def check_files() -> dict:
     return status
 
 
-def main():
+def main(network_report=None):
     """Run startup checks, then launch GUI."""
     if not check_python_version():
         sys.exit(1)
@@ -91,6 +91,8 @@ def main():
     template_sync_error = sync_bundled_template()
     file_status = check_files()
     warnings = []
+    if network_report:
+        warnings.extend(network_report.warnings)
     if template_sync_error:
         warnings.append(f"通用模板更新失败: {template_sync_error}")
     names = {"template": "上架模板 (韩国上传模板.xlsx)",
@@ -123,11 +125,14 @@ def main():
 if __name__ == "__main__":
     import os, sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from config_manager import load_config
+    from network_utils import initialize_network_environment
+    network_report = initialize_network_environment(load_config())
     import tkinter as tk
     import updater
     root = tk.Tk(); root.withdraw()
     if updater.check_and_update(root):
         root.destroy()
-        main()
+        main(network_report=network_report)
     else:
         root.destroy()

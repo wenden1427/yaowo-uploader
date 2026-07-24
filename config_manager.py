@@ -211,63 +211,9 @@ def load_banned_words(path):
 # ============================================================
 
 def detect_proxy():
-    """Auto-detect the HTTP proxy address.
-
-    Priority (first match wins):
-        1. Windows system proxy (registry
-           ``HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings``,
-           only when ProxyEnable == 1).
-        2. Environment variables ``HTTP_PROXY`` / ``HTTPS_PROXY`` / ``http_proxy``.
-        3. ``proxy`` field in config.yaml.
-        4. None — direct connection.
-
-    Returns
-    -------
-    str or None
-        Proxy URL in the form ``"http://127.0.0.1:7897"``, or ``None``.
-    """
-    # ---- 1. Windows registry ----
-    try:
-        import winreg
-
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-        )
-        try:
-            proxy_enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
-            if proxy_enable:
-                proxy_server, _ = winreg.QueryValueEx(key, "ProxyServer")
-                proxy_server = str(proxy_server).strip()
-                if proxy_server:
-                    # Registry value may be "http=127.0.0.1:7897;https=..."
-                    # or just "127.0.0.1:7897".  Take the first entry.
-                    server = proxy_server.split(";")[0].strip()
-                    if "=" in server:
-                        server = server.split("=", 1)[1].strip()
-                    if server and "://" not in server:
-                        server = "http://" + server
-                    if server:
-                        return server
-        finally:
-            winreg.CloseKey(key)
-    except Exception:
-        pass
-
-    # ---- 2. Environment variables ----
-    for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy"):
-        val = os.environ.get(var)
-        if val:
-            return val
-
-    # ---- 3. config.yaml ----
-    cfg = load_config()
-    proxy = cfg.get("proxy")
-    if proxy:
-        return str(proxy)
-
-    # ---- 4. No proxy ----
-    return None
+    """Return the usable explicit/system/environment proxy, if any."""
+    from network_utils import resolve_proxy
+    return resolve_proxy(config=load_config()).url
 
 
 # ============================================================

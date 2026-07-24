@@ -1,16 +1,24 @@
 """一键更新脚本 - 双击运行即可"""
 import os, sys, json, urllib.request, zipfile, shutil, tempfile
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
+
+from config_manager import load_config
+from network_utils import build_network_opener, initialize_network_environment
+
 REPO = "wenden1427/yaowo-uploader"
 API = f"https://api.github.com/repos/{REPO}/commits/main"
 ZIP = f"https://github.com/{REPO}/archive/refs/heads/main.zip"
-ROOT = os.path.dirname(os.path.abspath(__file__))
 VERSION_FILE = os.path.join(ROOT, "version.txt")
 
 print("=" * 40)
 print("  上传器 - 检查更新")
 print("=" * 40)
 print()
+
+initialize_network_environment(load_config())
+opener = build_network_opener("auto")
 
 # Check remote
 print("检查最新版本...")
@@ -19,31 +27,8 @@ try:
         "User-Agent": "YaoWo-Updater",
         "Accept": "application/vnd.github.v3+json",
     })
-    opener = urllib.request.build_opener()
-    # Try system proxy if direct fails
-    try:
-        with opener.open(req, timeout=10) as r:
-            data = json.loads(r.read())
-    except Exception:
-        import winreg
-        try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
-            enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
-            if enable:
-                server, _ = winreg.QueryValueEx(key, "ProxyServer")
-                server = str(server).split(";")[0].strip()
-                if "=" in server:
-                    server = server.split("=", 1)[1].strip()
-                if server:
-                    proxy = f"http://{server}" if "://" not in server else server
-                    opener = urllib.request.build_opener(
-                        urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-                    with opener.open(req, timeout=10) as r:
-                        data = json.loads(r.read())
-            winreg.CloseKey(key)
-        except Exception as e:
-            raise e
+    with opener.open(req, timeout=10) as r:
+        data = json.loads(r.read())
     remote_sha = data["sha"]
     print(f"最新版本: {remote_sha[:7]}")
 except Exception as e:
@@ -71,7 +56,10 @@ print("发现新版本! 开始下载...")
 # Download
 tmp = os.path.join(tempfile.gettempdir(), "uploader_update.zip")
 extract = os.path.join(tempfile.gettempdir(), "uploader_update_extract")
-urllib.request.urlretrieve(ZIP, tmp)
+zip_req = urllib.request.Request(ZIP, headers={"User-Agent": "YaoWo-Updater"})
+with opener.open(zip_req, timeout=60) as response:
+    with open(tmp, "wb") as handle:
+        shutil.copyfileobj(response, handle)
 
 # Extract
 if os.path.exists(extract):

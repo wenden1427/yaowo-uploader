@@ -9,5 +9,7 @@ categories_zh.json
 profile_ko.json
 .session*
 error.log
+network.log
+network.log.1
 .uploader_state.pkl
 store_profiles.yaml

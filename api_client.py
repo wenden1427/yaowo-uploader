@@ -49,23 +49,11 @@ def _get_config():
 def _make_opener(use_proxy):
     """Return a urllib opener.
 
-    When *use_proxy* is True the opener routes through ``detect_proxy()``.
-    When False (or when no proxy is detected / proxy is empty) it uses the
-    default urllib opener (direct connection).
+    Direct mode explicitly disables urllib's implicit environment proxy.
+    Proxy mode follows the centralized explicit/system/environment decision.
     """
-    if not use_proxy:
-        return urllib.request.build_opener()
-
-    from config_manager import detect_proxy
-    proxy_url = detect_proxy()
-    if not proxy_url:
-        return urllib.request.build_opener()
-
-    proxy_handler = urllib.request.ProxyHandler({
-        "http": proxy_url,
-        "https": proxy_url,
-    })
-    return urllib.request.build_opener(proxy_handler)
+    from network_utils import build_network_opener
+    return build_network_opener("proxy" if use_proxy else "direct")
 
 
 def _format_http_error(label, err, channel=None):

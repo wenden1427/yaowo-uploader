@@ -3,4 +3,5 @@ Set WshShell = CreateObject("WScript.Shell")
 RootDir = fso.GetParentFolderName(WScript.ScriptFullName)
 PythonPath = RootDir & "\python-portable\python\python.exe"
 ScriptPath = RootDir & "\main.py"
+WshShell.CurrentDirectory = RootDir
 WshShell.Run """" & PythonPath & """ """ & ScriptPath & """", 0, False

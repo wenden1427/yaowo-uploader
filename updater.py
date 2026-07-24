@@ -68,17 +68,9 @@ def _get_remote_commit_sha():
 
 
 def _make_network_opener():
-    """Build an opener that respects the configured/system proxy."""
-    try:
-        from config_manager import detect_proxy
-        proxy = detect_proxy()
-        if proxy:
-            return urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
-            )
-    except Exception:
-        pass
-    return urllib.request.build_opener()
+    """Build an opener using the same proxy decision as the main program."""
+    from network_utils import build_network_opener
+    return build_network_opener("auto")
 
 
 def _save_version(sha):

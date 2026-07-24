@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import updater
 import main as uploader_main
@@ -46,6 +47,12 @@ class UpdaterVersionTests(unittest.TestCase):
         updater.open = lambda *args, **kwargs: FakeFile()
 
         self.assertEqual(updater._get_local_version(), version_marker)
+
+    def test_network_opener_uses_central_auto_route(self):
+        sentinel = object()
+        with mock.patch("network_utils.build_network_opener", return_value=sentinel) as build:
+            self.assertIs(updater._make_network_opener(), sentinel)
+        build.assert_called_once_with("auto")
 
     def test_local_version_falls_back_to_git_head_when_version_file_missing(self):
         git_sha = "a" * 40
@@ -134,6 +141,20 @@ class UpdaterVersionTests(unittest.TestCase):
 
 
 class UpdaterCopyTests(unittest.TestCase):
+    def test_copy_update_tree_preserves_every_user_owned_file(self):
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as target:
+            for filename in updater.PRESERVED_FILES:
+                with open(os.path.join(source, filename), "w", encoding="utf-8") as handle:
+                    handle.write("repository default")
+                with open(os.path.join(target, filename), "w", encoding="utf-8") as handle:
+                    handle.write(f"user value for {filename}")
+
+            updater._copy_update_tree(source, target)
+
+            for filename in updater.PRESERVED_FILES:
+                with open(os.path.join(target, filename), encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), f"user value for {filename}")
+
     def test_copy_update_tree_updates_nested_assets_and_preserves_user_files(self):
         with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as target:
             os.makedirs(os.path.join(source, "uploader"))
