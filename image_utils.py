@@ -38,7 +38,8 @@ def ensure_marketplace_image_spec(image_bytes, max_bytes=MARKETPLACE_MAX_BYTES):
     raise ValueError(f"image cannot be compressed under {max_bytes} bytes, final size={len(data)}")
 
 
-def _load_rgb(image_bytes):
+def load_rgb_image(image_bytes):
+    """Decode an image as RGB, flattening transparency onto white."""
     img = Image.open(io.BytesIO(image_bytes))
     img = ImageOps.exif_transpose(img)
     if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
@@ -47,6 +48,11 @@ def _load_rgb(image_bytes):
         bg.paste(rgba, mask=rgba.split()[-1])
         return bg
     return img.convert("RGB")
+
+
+def _load_rgb(image_bytes):
+    """Backward-compatible private alias for the shared RGB decoder."""
+    return load_rgb_image(image_bytes)
 
 
 def _fit_dimensions(img):

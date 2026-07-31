@@ -17,7 +17,7 @@ from config_manager import load_config, load_prompts, load_categories, load_bann
 from config_manager import load_category_zh, save_category_zh
 from api_client import deepseek_chat, generate_image, download_image
 from api_client import create_storage_provider
-from image_utils import ensure_marketplace_image_spec
+from image_utils import ensure_marketplace_image_spec, load_rgb_image
 from store_profiles import (
     category_fields,
     load_store_profiles,
@@ -1178,7 +1178,7 @@ def _gen_detail_html(prod, all_products, storage):
         for u in deduped:
             try:
                 img_data = download_image(u)
-                img = Image.open(io.BytesIO(img_data))
+                img = load_rgb_image(img_data)
                 w, h = img.size
                 # Resize to width 800; ensure height >= 600 (ESM minimum)
                 new_h = max(int(h * 800 / w) if w else 600, 600)

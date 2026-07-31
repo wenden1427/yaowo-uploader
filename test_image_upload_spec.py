@@ -15,6 +15,13 @@ def make_jpeg(width, height, color=(240, 240, 240)):
     return buf.getvalue()
 
 
+def make_rgba_png(width=640, height=640):
+    img = Image.new("RGBA", (width, height), (20, 80, 160, 180))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def make_large_noisy_jpeg(width=6000, height=6000):
     img = Image.effect_noise((width, height), 100).convert("RGB")
     buf = io.BytesIO()
@@ -105,6 +112,22 @@ class ImageUploadSpecTests(unittest.TestCase):
                 raise Exception("upload failed")
 
         self.assertEqual(processor._collect_variant_imgs(prod, FailingStorage()), "")
+
+    def test_detail_html_flattens_transparent_images_before_jpeg_encoding(self):
+        prod = Product(parent_sku="P1", main_img="http://img/detail.png", platform="shein")
+        processor.download_image = lambda url: make_rgba_png()
+        uploaded_modes = []
+
+        class InspectingStorage:
+            def upload(self, image_bytes, filename="image.jpg"):
+                uploaded_modes.append(Image.open(io.BytesIO(image_bytes)).mode)
+                return "http://cloud/detail.jpg"
+
+        html = processor._gen_detail_html(prod, [prod], InspectingStorage())
+
+        self.assertIn("http://cloud/detail.jpg", html)
+        self.assertEqual(uploaded_modes, ["RGB"])
+        self.assertFalse(any("RGBA" in log for log in prod.logs))
 
     def test_main_image_generation_uploads_spec_safe_image(self):
         prod = Product(parent_sku="P1", main_img="http://img/main.jpg", platform="shein")
