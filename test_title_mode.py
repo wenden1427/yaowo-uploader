@@ -135,6 +135,27 @@ class TitleModeTests(unittest.TestCase):
         self.assertEqual(prod.subject_profile["sold_object_zh"], "厨房置物架")
         self.assertEqual(prod.subject_profile["referenced_objects"], ["전자레인지"])
 
+    def test_ai_rewrite_strips_unsupported_punctuation(self):
+        processor.deepseek_chat = lambda *args, **kwargs: '''{
+          "title": "남성 2-in-1 가죽 샌들",
+          "subject": {
+            "sold_object": "가죽 샌들",
+            "sold_object_ko": "가죽 샌들",
+            "category_terms_ko": ["샌들"],
+            "confidence": 0.95
+          }
+        }'''
+        prod = Product(title="men 2-in-1 leather sandals")
+
+        title = processor.phase1_title(
+            prod,
+            [],
+            prompts={"title": "Generate {product_title}. {color_note}"},
+            title_mode="ai_rewrite",
+        )
+
+        self.assertEqual(title, "남성 2 in 1 가죽 샌들")
+
 
 if __name__ == "__main__":
     unittest.main()

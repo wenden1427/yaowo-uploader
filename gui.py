@@ -322,7 +322,7 @@ class UploaderApp:
             "upload": saved_stats.get("upload", 0),
         }
         self._stat_label.configure(
-            text=f"DeepSeek: {self._stats['deepseek']} | 生图: {self._stats['image']} | 上传: {self._stats['upload']}")
+            text=f"文本AI: {self._stats['deepseek']} | 生图: {self._stats['image']} | 上传: {self._stats['upload']}")
         # Set output path from saved state
         output = state.get("output_path", "")
         if output:
@@ -1019,7 +1019,7 @@ class UploaderApp:
         store_id = suggestion.get("store_id", "")
         if store_id:
             self._refresh_store_profile_controls(store_id)
-        method = "DeepSeek" if suggestion.get("method") == "deepseek" else "规则"
+        method = "文本AI" if suggestion.get("method") == "deepseek" else "规则"
         confidence = float(suggestion.get("confidence", 0) or 0)
         if store_id and confidence >= 0.75:
             self._profile_confirmed = True
@@ -1340,13 +1340,18 @@ class UploaderApp:
         """API key configuration dialog."""
         dlg = tk.Toplevel(self.root)
         dlg.title("API 配置")
-        dlg.geometry("500x520")
+        dlg.geometry("520x560")
         dlg.transient(self.root)
         cfg = load_config()
         storage = cfg.get("storage", {})
+        from secure_credentials import get_credential, set_credential
         fields = [
-            ("DeepSeek Key (必填):", "deepseek_key", cfg.get("deepseek_key", ""), False),
-            ("DeepSeek URL:", "deepseek_url", cfg.get("deepseek_url", ""), False),
+            ("百炼 API Key（推荐）:", "bailian_api_key",
+             get_credential("bailian_api_key"), True),
+            ("DeepSeek Key（兼容备用）:", "deepseek_key",
+             cfg.get("deepseek_key", ""), True),
+            ("DeepSeek URL（兼容备用）:", "deepseek_url",
+             cfg.get("deepseek_url", ""), False),
             ("routeapi Key:", "routeapi_key", cfg.get("routeapi_key", ""), False),
             ("routeapi URL:", "routeapi_url", cfg.get("routeapi_url", ""), False),
             ("hfsyapi Key:", "hfsyapi_key", cfg.get("hfsyapi_key", ""), False),
@@ -1373,7 +1378,9 @@ class UploaderApp:
             }
             for key, e in entries.items():
                 v = e.get().strip()
-                if key in storage_keys:
+                if key == "bailian_api_key":
+                    set_credential(key, v)
+                elif key in storage_keys:
                     # Save to storage sub-dict
                     if v:
                         cfg.setdefault("storage", {})[key] = v

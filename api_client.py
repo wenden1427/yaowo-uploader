@@ -28,6 +28,7 @@ import urllib.request
 from abc import ABC, abstractmethod
 
 from image_utils import ensure_marketplace_image_spec
+from secure_credentials import get_credential
 
 DEFAULT_TENCENT_COS_BUCKET = "yaowoo-1443995558"
 DEFAULT_TENCENT_COS_REGION = "ap-hongkong"
@@ -82,7 +83,7 @@ def _format_http_error(label, err, channel=None):
 # 1. DeepSeek — chat
 # ============================================================
 
-def deepseek_chat(prompt, max_tokens=500, temp=0.7):
+def _deepseek_chat_legacy(prompt, max_tokens=500, temp=0.7):
     """Call the DeepSeek chat-completion API.
 
     Parameters
@@ -134,6 +135,68 @@ def deepseek_chat(prompt, max_tokens=500, temp=0.7):
             if attempt < 2:
                 time.sleep(1)
     raise last_err
+
+
+BAILIAN_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+DEFAULT_BAILIAN_MODEL = "qwen3.7-flash"
+
+
+def _bailian_chat(prompt, max_tokens=500, temp=0.7):
+    cfg = _get_config()
+    api_key = get_credential("bailian_api_key")
+    if not api_key:
+        raise RuntimeError("未配置百炼 API Key")
+    body = json.dumps({
+        "model": cfg.get("text_model", DEFAULT_BAILIAN_MODEL),
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temp,
+        "max_completion_tokens": max_tokens,
+        "enable_thinking": False,
+        "stream": False,
+    }, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "YaoWoUploader/2",
+    }
+    opener = _make_opener(use_proxy=False)
+    last_error = None
+    for attempt in range(3):
+        try:
+            request = urllib.request.Request(
+                cfg.get("bailian_url", BAILIAN_URL),
+                data=body,
+                headers=headers,
+            )
+            with opener.open(request, timeout=120) as response:
+                payload = json.loads(response.read())
+            return payload["choices"][0]["message"]["content"].strip()
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(1)
+    raise last_error
+
+
+def text_chat(prompt, max_tokens=500, temp=0.7):
+    """Prefer Bailian and preserve existing DeepSeek configs as a safe fallback."""
+    cfg = _get_config()
+    bailian_error = None
+    if get_credential("bailian_api_key"):
+        try:
+            return _bailian_chat(prompt, max_tokens=max_tokens, temp=temp)
+        except Exception as exc:
+            bailian_error = exc
+    if str(cfg.get("deepseek_key", "") or "").strip():
+        return _deepseek_chat_legacy(prompt, max_tokens=max_tokens, temp=temp)
+    if bailian_error is not None:
+        raise bailian_error
+    raise RuntimeError("未配置百炼 API Key，也没有可用的 DeepSeek 兼容配置")
+
+
+def deepseek_chat(prompt, max_tokens=500, temp=0.7):
+    """Compatibility name retained for existing processor and extension modules."""
+    return text_chat(prompt, max_tokens=max_tokens, temp=temp)
 
 
 # ============================================================

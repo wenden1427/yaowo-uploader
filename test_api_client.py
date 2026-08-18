@@ -76,6 +76,72 @@ class RecordingOpener:
         return EmptyResponse()
 
 
+class TextResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return json.dumps({
+            "choices": [{"message": {"content": "ok"}}]
+        }).encode("utf-8")
+
+
+class TextOpener:
+    def __init__(self):
+        self.requests = []
+
+    def open(self, req, timeout=None):
+        self.requests.append((req, timeout))
+        return TextResponse()
+
+
+class TextAIClientTests(unittest.TestCase):
+    def test_bailian_is_preferred_and_disables_thinking(self):
+        opener = TextOpener()
+        with mock.patch.object(
+            api_client, "get_credential", return_value="encrypted-user-key"
+        ), mock.patch.object(
+            api_client, "_get_config", return_value={"text_model": "qwen3.7-flash"}
+        ), mock.patch.object(
+            api_client, "_make_opener", return_value=opener
+        ):
+            self.assertEqual(api_client.text_chat("hello", max_tokens=80, temp=0), "ok")
+
+        request, timeout = opener.requests[0]
+        payload = json.loads(request.data)
+        self.assertIn("dashscope.aliyuncs.com", request.full_url)
+        self.assertEqual(payload["model"], "qwen3.7-flash")
+        self.assertEqual(payload["max_completion_tokens"], 80)
+        self.assertFalse(payload["enable_thinking"])
+        self.assertNotIn("encrypted-user-key", request.data.decode("utf-8"))
+        self.assertEqual(timeout, 120)
+
+    def test_existing_deepseek_config_remains_compatible_without_bailian(self):
+        opener = TextOpener()
+        with mock.patch.object(
+            api_client, "get_credential", return_value=""
+        ), mock.patch.object(
+            api_client,
+            "_get_config",
+            return_value={
+                "deepseek_key": "old-machine-key",
+                "deepseek_url": "https://api.deepseek.com/v1/chat/completions",
+            },
+        ), mock.patch.object(
+            api_client, "_make_opener", return_value=opener
+        ):
+            self.assertEqual(api_client.text_chat("hello", max_tokens=60, temp=0), "ok")
+
+        request, _ = opener.requests[0]
+        payload = json.loads(request.data)
+        self.assertEqual(payload["model"], "deepseek-chat")
+        self.assertEqual(payload["max_tokens"], 60)
+        self.assertNotIn("max_completion_tokens", payload)
+
+
 class RouteApiTests(unittest.TestCase):
     def setUp(self):
         self._orig_get_config = api_client._get_config

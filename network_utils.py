@@ -268,6 +268,7 @@ def _running_proxy_families(process_names=None):
 
 def _configured_hosts(config):
     urls = [
+        config.get("bailian_url", "https://dashscope.aliyuncs.com"),
         config.get("deepseek_url"),
         config.get("routeapi_url"),
         config.get("hfsyapi_url"),

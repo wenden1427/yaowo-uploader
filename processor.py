@@ -286,8 +286,9 @@ def _subject_prompt_rules():
         "do not rely on a fixed product keyword list. Evidence must be copied from the "
         "source title. Return Korean and Chinese category-style names when possible. "
         "Also provide several short taxonomy-style synonyms in category_terms_ko and "
-        "category_terms_zh. These terms must describe the sold item itself, never a "
-        "referenced or compatible object."
+        "category_terms_zh. These terms must be synonyms or taxonomy names for the "
+        "same sold item, never a bundled alternative item, referenced object, "
+        "compatible object, material, audience, or usage scene."
     )
 
 
@@ -361,7 +362,7 @@ def phase1_title(prod, banned_words, prompts, title_mode="ai_rewrite"):
         '"referenced_objects":[],"attributes":[],"evidence":[],"confidence":0.0}}\n\n'
         f"Auxiliary raw attributes (may be noisy): {getattr(prod, 'tag', '')}"
     )
-    result = deepseek_chat(combined_prompt, max_tokens=500, temp=0.7)
+    result = deepseek_chat(combined_prompt, max_tokens=500, temp=0.1)
     parsed = _parse_json_object_response(result)
     if parsed and str(parsed.get("title", "") or "").strip():
         title = str(parsed.get("title", "") or "").strip()
@@ -369,7 +370,7 @@ def phase1_title(prod, banned_words, prompts, title_mode="ai_rewrite"):
     else:
         title = str(result or "").strip()
         prod.subject_profile = _normalize_subject_profile({}, fallback_title=prod.title)
-    return _limit_title_length(title)
+    return _limit_title_length(_strip_generated_title_punctuation(title))
 
 
 def phase1_title_brand_only(title, banned_words):
@@ -401,6 +402,12 @@ def _limit_title_length(title, max_len=45):
                 return re.sub(f"[{separators}]+$", "", candidate).rstrip()
 
     return cut
+
+
+def _strip_generated_title_punctuation(title):
+    """Normalize unsupported generated punctuation without discarding the title."""
+    cleaned = re.sub(r"[^가-힣A-Za-z0-9\s]", " ", str(title or ""))
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def identify_brand_words_in_title(title, banned_words):

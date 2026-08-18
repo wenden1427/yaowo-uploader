@@ -103,9 +103,10 @@ def main(network_report=None):
             warnings.append(f"⚠ 未找到: {names[key]}")
 
     from config_manager import load_config
+    from secure_credentials import get_credential
     cfg = load_config()
-    if not cfg.get("deepseek_key"):
-        warnings.append("⚠ 未配置 DeepSeek API Key (设置→API配置)")
+    if not get_credential("bailian_api_key") and not cfg.get("deepseek_key"):
+        warnings.append("⚠ 未配置百炼或 DeepSeek API Key (设置→API配置)")
 
     from gui import UploaderApp
 
