@@ -79,11 +79,16 @@ class TitleModeTests(unittest.TestCase):
         response = '''{
           "brand_words": ["ZARA"],
           "subject": {
+            "head_noun_ko": "선반",
+            "head_noun_zh": "置物架",
             "sold_object": "wall-mounted storage shelf",
             "sold_object_ko": "벽걸이 수납 선반",
             "sold_object_zh": "壁挂收纳架",
             "buyer_receives": "a metal shelf",
             "primary_function": "storage and support",
+            "audience_age": "adult",
+            "audience_gender": "unisex",
+            "audience_evidence": ["adult household item"],
             "referenced_objects": ["microwave"],
             "attributes": ["wall-mounted"],
             "evidence": ["Storage Rack"],
@@ -100,8 +105,12 @@ class TitleModeTests(unittest.TestCase):
 
         self.assertEqual(title, "Wall Mounted Microwave Storage Rack")
         self.assertEqual(len(calls), 1)
+        self.assertEqual(prod.subject_profile["head_noun_ko"], "선반")
+        self.assertEqual(prod.subject_profile["head_noun_zh"], "置物架")
         self.assertEqual(prod.subject_profile["sold_object_ko"], "벽걸이 수납 선반")
         self.assertEqual(prod.subject_profile["referenced_objects"], ["microwave"])
+        self.assertEqual(prod.subject_profile["audience_age"], "adult")
+        self.assertEqual(prod.subject_profile["audience_gender"], "unisex")
         self.assertEqual(prod.subject_profile["confidence"], 0.97)
 
     def test_ai_rewrite_collects_subject_without_a_second_call(self):

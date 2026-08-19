@@ -141,6 +141,22 @@ class TextAIClientTests(unittest.TestCase):
         self.assertEqual(payload["max_tokens"], 60)
         self.assertNotIn("max_completion_tokens", payload)
 
+    def test_bailian_task_can_override_the_default_model(self):
+        opener = TextOpener()
+        with mock.patch.object(
+            api_client, "get_credential", return_value="encrypted-user-key"
+        ), mock.patch.object(
+            api_client, "_get_config", return_value={"text_model": "qwen3.7-flash"}
+        ), mock.patch.object(
+            api_client, "_make_opener", return_value=opener
+        ):
+            api_client.text_chat(
+                "choose category", max_tokens=80, temp=0, model="qwen3.7-plus"
+            )
+
+        payload = json.loads(opener.requests[0][0].data)
+        self.assertEqual(payload["model"], "qwen3.7-plus")
+
 
 class RouteApiTests(unittest.TestCase):
     def setUp(self):

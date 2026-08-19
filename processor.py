@@ -200,6 +200,8 @@ def write_product_row(tws, row_idx, prod, fixed, tpl_start_row, category_fixed=N
 # ---- Phase 1: Serial per-product ----
 
 _SUBJECT_PROFILE_FIELDS = (
+    "head_noun_ko",
+    "head_noun_zh",
     "sold_object",
     "sold_object_ko",
     "sold_object_zh",
@@ -207,6 +209,9 @@ _SUBJECT_PROFILE_FIELDS = (
     "primary_function",
     "category_terms_ko",
     "category_terms_zh",
+    "audience_age",
+    "audience_gender",
+    "audience_evidence",
     "referenced_objects",
     "attributes",
     "evidence",
@@ -249,11 +254,19 @@ def _normalize_subject_profile(value, fallback_title=""):
     """Normalize model output without using product-specific dictionaries."""
     raw = value if isinstance(value, dict) else {}
     profile = {}
-    for key in ("sold_object", "sold_object_ko", "sold_object_zh",
+    for key in ("head_noun_ko", "head_noun_zh", "sold_object", "sold_object_ko", "sold_object_zh",
                 "buyer_receives", "primary_function"):
         profile[key] = str(raw.get(key, "") or "").strip()
+    profile["audience_age"] = str(raw.get("audience_age", "unknown") or "unknown").strip().lower()
+    if profile["audience_age"] not in {"infant", "child", "adult", "all_ages", "unknown"}:
+        profile["audience_age"] = "unknown"
+    profile["audience_gender"] = str(
+        raw.get("audience_gender", "unknown") or "unknown"
+    ).strip().lower()
+    if profile["audience_gender"] not in {"male", "female", "unisex", "unknown"}:
+        profile["audience_gender"] = "unknown"
     for key in ("category_terms_ko", "category_terms_zh", "referenced_objects",
-                "attributes", "evidence"):
+                "attributes", "evidence", "audience_evidence"):
         profile[key] = _subject_list(raw.get(key))
     try:
         profile["confidence"] = max(0.0, min(1.0, float(raw.get("confidence", 0) or 0)))
@@ -284,11 +297,23 @@ def _subject_prompt_rules():
         "shown with. Do not treat materials, origins, dimensions, styles, compatible "
         "objects, or usage scenes as the sold item. Use semantic understanding only; "
         "do not rely on a fixed product keyword list. Evidence must be copied from the "
-        "source title. Return Korean and Chinese category-style names when possible. "
+        "source title. The source title is authoritative for the item type; noisy raw "
+        "attributes may refine it but must never replace it. Use the most specific "
+        "category-defining noun phrase explicitly supported by the title, rather than "
+        "collapsing it to a broad parent object. Return Korean and Chinese category-style "
+        "names when possible. "
         "Also provide several short taxonomy-style synonyms in category_terms_ko and "
         "category_terms_zh. These terms must be synonyms or taxonomy names for the "
         "same sold item, never a bundled alternative item, referenced object, "
-        "compatible object, material, audience, or usage scene."
+        "compatible object, material, audience, or usage scene. Determine audience_age "
+        "as infant, child, adult, all_ages, or unknown and audience_gender as male, "
+        "female, unisex, or unknown. Use explicit source evidence only; when evidence "
+        "conflicts or is absent, return unknown. Copy the supporting words into "
+        "audience_evidence. Also return head_noun_ko and head_noun_zh: the most specific "
+        "taxonomy-defining head noun or fixed noun compound explicitly present in the "
+        "source. Preserve the product subtype noun and never generalize it to a broad "
+        "parent class. Exclude only modifiers such as material, shape, height, style, "
+        "audience, and compatible object."
     )
 
 
@@ -302,9 +327,11 @@ def _brand_only_title_and_subject(prod, banned_words):
         "functions, or product names as brands.\n"
         f"2. {_subject_prompt_rules()}\n\n"
         "Return JSON only with this exact shape:\n"
-        '{"brand_words":[],"subject":{"sold_object":"","sold_object_ko":"",'
+        '{"brand_words":[],"subject":{"head_noun_ko":"","head_noun_zh":"",'
+        '"sold_object":"","sold_object_ko":"",'
         '"sold_object_zh":"","buyer_receives":"","primary_function":"",'
-        '"category_terms_ko":[],"category_terms_zh":[],'
+        '"category_terms_ko":[],"category_terms_zh":[],"audience_age":"unknown",'
+        '"audience_gender":"unknown","audience_evidence":[],'
         '"referenced_objects":[],"attributes":[],"evidence":[],"confidence":0.0}}\n\n'
         f"Source title: {title}\n"
         f"Auxiliary raw attributes (may be noisy): {getattr(prod, 'tag', '')}\n"
@@ -356,9 +383,11 @@ def phase1_title(prod, banned_words, prompts, title_mode="ai_rewrite"):
         f"TITLE TASK:\n{prompt}\n\n"
         f"SOLD-ITEM TASK:\n{_subject_prompt_rules()}\n\n"
         "Return JSON only with this exact shape:\n"
-        '{"title":"","subject":{"sold_object":"","sold_object_ko":"",'
+        '{"title":"","subject":{"head_noun_ko":"","head_noun_zh":"",'
+        '"sold_object":"","sold_object_ko":"",'
         '"sold_object_zh":"","buyer_receives":"","primary_function":"",'
-        '"category_terms_ko":[],"category_terms_zh":[],'
+        '"category_terms_ko":[],"category_terms_zh":[],"audience_age":"unknown",'
+        '"audience_gender":"unknown","audience_evidence":[],'
         '"referenced_objects":[],"attributes":[],"evidence":[],"confidence":0.0}}\n\n'
         f"Auxiliary raw attributes (may be noisy): {getattr(prod, 'tag', '')}"
     )
@@ -588,6 +617,7 @@ def _find_category_parent(categories, profile_key):
 
 _CATEGORY_ZH_MAP = None
 _CATEGORY_SEMANTIC_FEATURES = {}
+CATEGORY_REVIEW_MODEL = "qwen3.7-flash"
 
 
 def _category_zh_map():
@@ -638,6 +668,8 @@ def _semantic_similarity_features(left, right):
 
     shorter = min(len(left_compact), len(right_compact))
     longer = max(len(left_compact), len(right_compact))
+    if shorter < 2:
+        return 0.0
     containment = 0.0
     if left_compact in right_compact or right_compact in left_compact:
         containment = 0.72 + 0.28 * (shorter / longer)
@@ -654,6 +686,71 @@ def _semantic_similarity_features(left, right):
 def _semantic_similarity(left, right):
     """Language-agnostic lexical similarity used only for candidate recall."""
     return _semantic_similarity_features(_semantic_features(left), _semantic_features(right))
+
+
+def _directional_gram_coverage(source, target):
+    """Measure how much of a candidate term is supported, independent of word order."""
+    source_grams = _character_ngrams(source)
+    target_grams = _character_ngrams(target)
+    if not source_grams or not target_grams:
+        return 0.0
+    return len(source_grams & target_grams) / len(target_grams)
+
+
+def _compound_reference_support(identity_texts, referenced, leaf_targets):
+    """Recognize categories such as fridge-tray without accepting fridge itself."""
+    evidence = " ".join(identity_texts)
+    best = 0.0
+    for target_features in leaf_targets:
+        target = target_features[0]
+        for reference in referenced:
+            reference_compact = _compact_semantic_text(reference)
+            if (len(reference_compact) < 2 or reference_compact not in target
+                    or len(target) - len(reference_compact) < 2):
+                continue
+            remainder = target.replace(reference_compact, "", 1)
+            best = max(best, _directional_gram_coverage(evidence, remainder))
+    return best
+
+
+def _reference_variants(profile):
+    variants = []
+    for value in _subject_list(profile.get("referenced_objects")):
+        for part in [value] + re.findall(
+                r"[가-힣]+|[A-Za-z]+|[\u4e00-\u9fff]+", value
+        ):
+            compact = _compact_semantic_text(part)
+            if len(compact) >= 2 and part not in variants:
+                variants.append(part)
+    return variants
+
+
+def _refine_away_from_referenced_object(profile, selected, candidates):
+    """Reject a category that describes only an object mentioned for context."""
+    referenced = _reference_variants(profile)
+    if not referenced:
+        return selected
+    identity_texts = _profile_identity_texts(profile)
+
+    def reference_only(path):
+        path_zh = str(_category_zh_map().get(path, "") or "")
+        leaf_targets, _ = _category_semantic_targets(path, path_zh)
+        reference_match = max(
+            (_semantic_similarity(reference, target[0])
+             for reference in referenced for target in leaf_targets),
+            default=0.0,
+        )
+        compound_match = _compound_reference_support(
+            identity_texts, referenced, leaf_targets
+        )
+        return reference_match >= 0.9 and compound_match < 0.55
+
+    if not reference_only(selected[0]):
+        return selected
+    for _, path, codes in candidates:
+        if not reference_only(path):
+            return path, codes
+    return selected
 
 
 def _category_semantic_targets(path, path_zh):
@@ -676,7 +773,9 @@ def _category_semantic_targets(path, path_zh):
 
 def _profile_identity_texts(profile):
     texts = []
-    for key in ("sold_object_ko", "sold_object_zh", "sold_object", "buyer_receives"):
+    for key in (
+            "head_noun_ko", "head_noun_zh", "sold_object_ko", "sold_object_zh",
+            "sold_object", "buyer_receives"):
         text = str(profile.get(key, "") or "").strip()
         if text and text not in texts:
             texts.append(text)
@@ -694,6 +793,172 @@ def _subject_profile_is_usable(profile):
         return float(profile.get("confidence", 0) or 0) > 0
     except (TypeError, ValueError):
         return False
+
+
+_AUDIENCE_AGE_TERMS = {
+    "infant": (
+        "신생아", "영아", "유아", "아기", "베이비", "婴儿", "婴幼", "宝宝",
+        "newborn", "infant", "baby",
+    ),
+    "child": (
+        "유아동", "아동", "어린이", "키즈", "남아", "여아", "儿童", "童鞋",
+        "童装", "男童", "女童", "kids", "kid", "child", "children", "boy", "girl",
+    ),
+    "adult": (
+        "성인", "남성", "여성", "남자", "여자", "신사", "숙녀", "成人", "男士",
+        "女士", "임산부", "임부", "孕妇", "adult", "men", "women", "man", "woman",
+        "maternity", "pregnant",
+    ),
+}
+_AUDIENCE_GENDER_TERMS = {
+    "male": ("남성", "남자", "신사", "男士", "男款", "male", "men", "man"),
+    "female": (
+        "여성", "여자", "숙녀", "임산부", "女士", "女款", "孕妇", "female",
+        "women", "woman", "maternity", "pregnant",
+    ),
+    "unisex": ("남녀", "남여", "공용", "男女", "中性", "unisex"),
+}
+
+
+def _contains_audience_term(text, term):
+    text = str(text or "").casefold()
+    term = str(term or "").casefold()
+    if not text or not term:
+        return False
+    if term.isascii() and term.isalnum():
+        return re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text) is not None
+    return term in text
+
+
+def _audience_signals(text, terms_by_value):
+    return {
+        value
+        for value, terms in terms_by_value.items()
+        if any(_contains_audience_term(text, term) for term in terms)
+    }
+
+
+def _resolve_audience_value(title_signals, model_value, tag_signals, allowed):
+    if len(title_signals) == 1:
+        return next(iter(title_signals))
+    if len(title_signals) > 1:
+        return "unknown"
+    if model_value in allowed:
+        return model_value
+    if len(tag_signals) == 1:
+        return next(iter(tag_signals))
+    return "unknown"
+
+
+def _source_audience_constraints(prod, profile):
+    title = str(getattr(prod, "title", "") or "")
+    tag = str(getattr(prod, "tag", "") or "")
+    title_age = _audience_signals(title, _AUDIENCE_AGE_TERMS)
+    tag_age = _audience_signals(tag, _AUDIENCE_AGE_TERMS)
+    title_gender = _audience_signals(title, _AUDIENCE_GENDER_TERMS)
+    tag_gender = _audience_signals(tag, _AUDIENCE_GENDER_TERMS)
+    model_age = str(profile.get("audience_age", "unknown") or "unknown").lower()
+    model_gender = str(profile.get("audience_gender", "unknown") or "unknown").lower()
+    if title_gender == {"male", "female"} and model_gender == "unisex":
+        title_gender = {"unisex"}
+    return {
+        "age": _resolve_audience_value(
+            title_age, model_age, tag_age, {"infant", "child", "adult", "all_ages"}
+        ),
+        "gender": _resolve_audience_value(
+            title_gender, model_gender, tag_gender, {"male", "female", "unisex"}
+        ),
+    }
+
+
+def _candidate_audience_signals(path):
+    path_zh = str(_category_zh_map().get(path, "") or "")
+    ko_segments = [segment for segment in str(path or "").split(">") if segment]
+    zh_segments = [segment for segment in path_zh.split(">") if segment]
+
+    def most_specific_signals(terms):
+        for index in range(max(len(ko_segments), len(zh_segments)) - 1, -1, -1):
+            text = " ".join(
+                segments[index] for segments in (ko_segments, zh_segments)
+                if index < len(segments)
+            )
+            signals = _audience_signals(text, terms)
+            if signals:
+                return signals
+        return set()
+
+    return {
+        "age": most_specific_signals(_AUDIENCE_AGE_TERMS),
+        "gender": most_specific_signals(_AUDIENCE_GENDER_TERMS),
+    }
+
+
+def _candidate_conflicts_with_audience(path, constraints):
+    candidate = _candidate_audience_signals(path)
+    source_age = constraints.get("age", "unknown")
+    candidate_age = candidate["age"]
+    if source_age == "adult" and candidate_age.intersection({"infant", "child"}):
+        return True
+    if source_age in {"infant", "child"} and "adult" in candidate_age:
+        return True
+    source_gender = constraints.get("gender", "unknown")
+    candidate_gender = candidate["gender"]
+    if source_gender == "male" and "female" in candidate_gender and "unisex" not in candidate_gender:
+        return True
+    if source_gender == "female" and "male" in candidate_gender and "unisex" not in candidate_gender:
+        return True
+    return False
+
+
+def _audience_qualified_leaf_support(path, profile, candidate):
+    leaf_texts = [str(path or "").split(">")[-1]]
+    path_zh = str(_category_zh_map().get(path, "") or "")
+    if path_zh:
+        leaf_texts.append(path_zh.split(">")[-1])
+    evidence = " ".join(
+        _profile_identity_texts(profile) + _subject_list(profile.get("evidence"))
+    )
+    best = 0.0
+    for dimension, terms_by_value in (
+            ("age", _AUDIENCE_AGE_TERMS), ("gender", _AUDIENCE_GENDER_TERMS)):
+        for value in candidate[dimension]:
+            for term in terms_by_value.get(value, ()):
+                for leaf in leaf_texts:
+                    leaf_compact = _compact_semantic_text(leaf)
+                    term_compact = _compact_semantic_text(term)
+                    if term_compact not in leaf_compact:
+                        continue
+                    remainder = leaf_compact.replace(term_compact, "", 1)
+                    if len(remainder) < 2:
+                        continue
+                    best = max(best, _directional_gram_coverage(evidence, remainder))
+    return best
+
+
+def _filter_categories_by_audience(prod, profile, scored):
+    constraints = _source_audience_constraints(prod, profile)
+    if constraints == {"age": "unknown", "gender": "unknown"}:
+        return scored, constraints, 0
+    filtered = []
+    for score, path, codes in scored:
+        if _candidate_conflicts_with_audience(path, constraints):
+            continue
+        candidate = _candidate_audience_signals(path)
+        age = constraints.get("age", "unknown")
+        gender = constraints.get("gender", "unknown")
+        if age in candidate["age"]:
+            score += 0.32
+        elif age in {"infant", "child"} and candidate["age"].intersection(
+                {"infant", "child"}):
+            score += 0.12
+        if gender in candidate["gender"]:
+            score += 0.12 if gender != "unisex" else 0.08
+        qualified_support = _audience_qualified_leaf_support(path, profile, candidate)
+        if qualified_support >= 0.55:
+            score += qualified_support * 0.45
+        filtered.append((score, path, codes))
+    filtered.sort(key=lambda item: item[0], reverse=True)
+    return filtered, constraints, len(scored) - len(filtered)
 
 
 def _score_categories_from_subject(profile, categories):
@@ -732,8 +997,19 @@ def _score_categories_from_subject(profile, categories):
         )
 
         score = leaf_match * 0.72 + path_match * 0.20 + function_match * 0.08
+        sold_category_match = max(leaf_match, path_match)
+        compound_reference_match = _compound_reference_support(
+            identity_texts, referenced, leaf_targets
+        )
+        composition_match = max(
+            min(reference_match, sold_category_match),
+            min(reference_match, compound_reference_match),
+        )
+        if composition_match >= 0.55:
+            score += composition_match * 0.50
         if (referenced and reference_match >= 0.65
-                and reference_match >= leaf_match * 0.75):
+                and compound_reference_match < 0.55
+                and reference_match > sold_category_match * 1.15):
             score -= reference_match * 0.65
         if score > 0.12:
             scored.append((score, path, codes))
@@ -795,7 +1071,7 @@ def _score_categories_legacy(title, tag, categories, profile_key=""):
     return scored
 
 
-def _select_category_with_deepseek(prod, profile, candidates):
+def _select_category_with_deepseek(prod, profile, candidates, audience_constraints=None):
     zh_map = _category_zh_map()
     prompt_candidates = []
     by_id = {}
@@ -811,22 +1087,41 @@ def _select_category_with_deepseek(prod, profile, candidates):
         "You are selecting a Korean marketplace category. Classify the physical item "
         "the buyer receives, not an object it stores, supports, protects, connects to, "
         "fits, controls, or is shown with. Materials, origins, dimensions, styles, and "
-        "usage scenes must not determine the category. Use only the supplied candidates "
+        "usage scenes must not determine the category. Explicit age group and gender "
+        "evidence are hard compatibility constraints: never place an adult item in an "
+        "infant/children category or a clearly male/female item in the opposite gender "
+        "category. First identify the most specific item-type noun phrase in the source "
+        "title. Treat this as a hard grammatical rule: in a modifier + head-noun phrase, "
+        "the category must describe the head noun. A candidate describing only a "
+        "modifier or attribute is incompatible, even when that modifier is an exact "
+        "word match. The head noun outranks values such as material, shape, height, "
+        "construction, and style. Prefer the most specific compatible "
+        "leaf supported by the source. Use an Other/miscellaneous category only when no "
+        "specific candidate or uploadable parent describes the same sold item, including "
+        "ordinary marketplace synonyms. Every ancestor segment in a candidate path is "
+        "a binding physical-product constraint. Reject a path when any ancestor turns "
+        "the item into media, a publication, a service, a component, or an accessory for "
+        "a different object, even if its leaf repeats a source keyword. "
+        "Use only the supplied candidates "
         "and copy one candidate_id exactly. Return JSON only with candidate_id, "
         "same_sold_object, confidence, and evidence. same_sold_object must be true only "
         "when the selected category describes the sold item itself.\n\n"
+        f"Source title: {str(getattr(prod, 'title', '') or '')}\n"
+        f"Source attributes: {str(getattr(prod, 'tag', '') or '')[:1200]}\n"
+        f"Audience constraints: {json.dumps(audience_constraints or {}, ensure_ascii=False)}\n"
         f"Sold-item analysis: {json.dumps(profile, ensure_ascii=False)}\n"
         f"Candidates: {json.dumps(prompt_candidates, ensure_ascii=False)}"
     )
     prod.result["_category_deepseek_calls"] = (
         int(prod.result.get("_category_deepseek_calls", 0) or 0) + 1
     )
-    response = deepseek_chat(prompt, max_tokens=300, temp=0.1)
+    response = deepseek_chat(
+        prompt, max_tokens=300, temp=0.1, model=CATEGORY_REVIEW_MODEL
+    )
     parsed = _parse_json_object_response(response)
     if parsed:
         candidate_id = str(parsed.get("candidate_id", "") or "").strip()
-        same_object = parsed.get("same_sold_object", True)
-        if candidate_id in by_id and same_object is not False:
+        if candidate_id in by_id:
             return by_id[candidate_id]
         return None
     matched = str(response or "").strip()
@@ -834,6 +1129,148 @@ def _select_category_with_deepseek(prod, profile, candidates):
         if matched == path:
             return path, codes
     return None
+
+
+def _category_candidate_pool(scored, base_limit=30, ancestor_limit=20):
+    """Keep high-score leaves and add their uploadable ancestors for AI review."""
+    base = list(scored[:base_limit])
+    by_path = {path: item for item in scored for path in (item[1],)}
+    seen = {item[1] for item in base}
+    ancestors = []
+    for _, path, _ in base:
+        segments = path.split(">")
+        for depth in range(len(segments) - 1, 0, -1):
+            ancestor = ">".join(segments[:depth])
+            item = by_path.get(ancestor)
+            if item is None or ancestor in seen:
+                continue
+            seen.add(ancestor)
+            ancestors.append(item)
+            if len(ancestors) >= ancestor_limit:
+                return base + ancestors
+    return base + ancestors
+
+
+def _refine_to_supported_specific_category(prod, profile, selected, candidates):
+    selected_path, _ = selected
+    selected_leaf = _compact_semantic_text(selected_path.split(">")[-1])
+    if len(selected_leaf) < 2:
+        return selected
+    evidence_text = " ".join(
+        [
+            str(getattr(prod, "title", "") or ""),
+            str(getattr(prod, "tag", "") or ""),
+        ]
+        + _profile_identity_texts(profile)
+        + _subject_list(profile.get("evidence"))
+    )
+    evidence_compact = _compact_semantic_text(evidence_text)
+    refinements = []
+    for score, path, codes in candidates:
+        if path == selected_path or path.count(">") <= selected_path.count(">"):
+            continue
+        leaf = _compact_semantic_text(path.split(">")[-1])
+        if selected_leaf not in leaf or leaf == selected_leaf:
+            continue
+        added = leaf.replace(selected_leaf, "", 1)
+        if len(added) < 2 or added not in evidence_compact:
+            continue
+        refinements.append((path.count(">"), len(leaf), score, path, codes))
+    if not refinements:
+        return selected
+    refinements.sort(reverse=True)
+    return refinements[0][3], refinements[0][4]
+
+
+def _head_noun_leaf_support(profile, path):
+    supporting_texts = [
+        str(profile.get(key, "") or "").strip()
+        for key in ("sold_object_ko", "sold_object_zh", "sold_object", "buyer_receives")
+    ] + _subject_list(profile.get("category_terms_ko")) + _subject_list(
+        profile.get("category_terms_zh")
+    )
+    head_nouns = []
+    for key in ("head_noun_ko", "head_noun_zh"):
+        head = str(profile.get(key, "") or "").strip()
+        head_compact = _compact_semantic_text(head)
+        if not head_compact:
+            continue
+        supported = any(
+            head_compact == _compact_semantic_text(text)
+            or (len(head_compact) >= 3 and head_compact in _compact_semantic_text(text))
+            for text in supporting_texts
+        )
+        if supported:
+            head_nouns.append(head)
+    leaf_texts = [str(path or "").split(">")[-1]]
+    path_zh = str(_category_zh_map().get(path, "") or "")
+    if path_zh:
+        leaf_texts.append(path_zh.split(">")[-1])
+    best = 0.0
+    for head in head_nouns:
+        head_compact = _compact_semantic_text(head)
+        for leaf in leaf_texts:
+            leaf_compact = _compact_semantic_text(leaf)
+            if head_compact == leaf_compact:
+                best = max(best, 1.0)
+            elif len(head_compact) >= 3 and head_compact in leaf_compact:
+                best = max(best, 0.9)
+            elif (len(leaf_compact) >= 3 and head_compact.endswith(leaf_compact)
+                    and len(leaf_compact) / len(head_compact) >= 0.45):
+                best = max(best, 0.88)
+    return best
+
+
+def _refine_to_head_noun_category(
+        profile, selected, candidates, audience_constraints=None):
+    selected_support = _head_noun_leaf_support(profile, selected[0])
+    selected_audience = _candidate_audience_signals(selected[0])
+    source_age = (audience_constraints or {}).get("age", "unknown")
+    source_gender = (audience_constraints or {}).get("gender", "unknown")
+    selected_adjusted = selected_support
+    if source_age in selected_audience["age"]:
+        selected_adjusted += 0.15
+    if source_gender in selected_audience["gender"]:
+        selected_adjusted += 0.08
+    supported = []
+    for score, path, codes in candidates:
+        support = _head_noun_leaf_support(profile, path)
+        if support >= 0.82:
+            candidate_audience = _candidate_audience_signals(path)
+            audience_bonus = 0.0
+            if source_age in candidate_audience["age"]:
+                audience_bonus += 0.15
+            if source_gender in candidate_audience["gender"]:
+                audience_bonus += 0.08
+            supported.append((
+                support + audience_bonus, support, score, path.count(">"), path, codes
+            ))
+    if not supported:
+        return selected
+    supported.sort(reverse=True)
+    best = supported[0]
+    if best[0] <= selected_adjusted + 0.02:
+        return selected
+    return best[4], best[5]
+
+
+def _refine_to_dominant_root(profile, selected, scored, sample_limit=40):
+    if _head_noun_leaf_support(profile, selected[0]) >= 0.45:
+        return selected
+    selected_root = selected[0].split(">", 1)[0]
+    selected_score = next(
+        (score for score, path, _ in scored if path == selected[0]), 0.0
+    )
+    if len(scored) >= 2:
+        first_root = scored[0][1].split(">", 1)[0]
+        second_root = scored[1][1].split(">", 1)[0]
+        if (
+            selected_root != first_root
+            and first_root == second_root
+            and scored[0][0] >= selected_score * 1.1
+        ):
+            return scored[0][1], scored[0][2]
+    return selected
 
 
 def phase1_category(prod, categories, profile_key=""):
@@ -856,29 +1293,56 @@ def phase1_category(prod, categories, profile_key=""):
     if not scored:
         return "", "", "", ""
 
-    try:
-        subject_confidence = float(profile.get("confidence", 0) or 0)
-    except (TypeError, ValueError):
-        subject_confidence = 0.0
-    high_confidence_subject_match = (
-        using_subject
-        and subject_confidence >= 0.85
-        and scored[0][0] >= 0.72
+    scored, audience_constraints, filtered_count = _filter_categories_by_audience(
+        prod, profile, scored
     )
-    clear_winner = (
-        len(scored) == 1
-        or scored[0][0] > scored[1][0] * 1.5
-        or high_confidence_subject_match
-    )
+    prod.result["_category_audience"] = audience_constraints
+    prod.result["_category_audience_filtered"] = filtered_count
+    if not scored:
+        return "", "", "", ""
+
+    clear_winner = len(scored) == 1
     selected = (scored[0][1], scored[0][2]) if clear_winner else None
     if selected is None:
-        candidates = scored[:30 if using_subject else 15]
+        candidates = (
+            _category_candidate_pool(scored, base_limit=160, ancestor_limit=20)
+            if using_subject else scored[:15]
+        )
         try:
-            selected = _select_category_with_deepseek(prod, profile, candidates)
-        except Exception:
+            selected = _select_category_with_deepseek(
+                prod, profile, candidates, audience_constraints=audience_constraints
+            )
+        except Exception as exc:
+            prod.logs.append(
+                f"{time.strftime('%H:%M:%S')} 类目AI复判失败，使用本地最高分: {exc}"
+            )
             selected = None
     if selected is None:
-        return "", "", "", ""
+        prod.logs.append(
+            f"{time.strftime('%H:%M:%S')} 类目AI未返回有效候选，使用本地最高分"
+        )
+        selected = (scored[0][1], scored[0][2])
+
+    candidate_pool = (
+        _category_candidate_pool(scored, base_limit=160, ancestor_limit=20)
+        if using_subject else scored[:15]
+    )
+    selected = _refine_away_from_referenced_object(
+        profile, selected, candidate_pool
+    )
+    selected = _refine_to_supported_specific_category(
+        prod,
+        profile,
+        selected,
+        candidate_pool,
+    )
+    selected = _refine_to_head_noun_category(
+        profile,
+        selected,
+        candidate_pool,
+        audience_constraints=audience_constraints,
+    )
+    selected = _refine_to_dominant_root(profile, selected, scored)
 
     matched_path, best = selected
     return (

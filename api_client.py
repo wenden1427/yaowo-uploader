@@ -141,13 +141,13 @@ BAILIAN_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completion
 DEFAULT_BAILIAN_MODEL = "qwen3.7-flash"
 
 
-def _bailian_chat(prompt, max_tokens=500, temp=0.7):
+def _bailian_chat(prompt, max_tokens=500, temp=0.7, model=None):
     cfg = _get_config()
     api_key = get_credential("bailian_api_key")
     if not api_key:
         raise RuntimeError("未配置百炼 API Key")
     body = json.dumps({
-        "model": cfg.get("text_model", DEFAULT_BAILIAN_MODEL),
+        "model": model or cfg.get("text_model", DEFAULT_BAILIAN_MODEL),
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temp,
         "max_completion_tokens": max_tokens,
@@ -178,13 +178,15 @@ def _bailian_chat(prompt, max_tokens=500, temp=0.7):
     raise last_error
 
 
-def text_chat(prompt, max_tokens=500, temp=0.7):
+def text_chat(prompt, max_tokens=500, temp=0.7, model=None):
     """Prefer Bailian and preserve existing DeepSeek configs as a safe fallback."""
     cfg = _get_config()
     bailian_error = None
     if get_credential("bailian_api_key"):
         try:
-            return _bailian_chat(prompt, max_tokens=max_tokens, temp=temp)
+            return _bailian_chat(
+                prompt, max_tokens=max_tokens, temp=temp, model=model
+            )
         except Exception as exc:
             bailian_error = exc
     if str(cfg.get("deepseek_key", "") or "").strip():
@@ -194,9 +196,9 @@ def text_chat(prompt, max_tokens=500, temp=0.7):
     raise RuntimeError("未配置百炼 API Key，也没有可用的 DeepSeek 兼容配置")
 
 
-def deepseek_chat(prompt, max_tokens=500, temp=0.7):
+def deepseek_chat(prompt, max_tokens=500, temp=0.7, model=None):
     """Compatibility name retained for existing processor and extension modules."""
-    return text_chat(prompt, max_tokens=max_tokens, temp=temp)
+    return text_chat(prompt, max_tokens=max_tokens, temp=temp, model=model)
 
 
 # ============================================================
