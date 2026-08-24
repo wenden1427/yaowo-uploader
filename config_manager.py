@@ -13,6 +13,19 @@ Manages all configuration I/O:
 import os
 import yaml
 
+
+DEFAULT_BATCH_SIZE = 50
+MAX_BATCH_SIZE = 50
+
+
+def normalize_batch_size(value, default=DEFAULT_BATCH_SIZE):
+    """Return a valid queue/image concurrency value in the supported range."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = default
+    return max(1, min(MAX_BATCH_SIZE, value))
+
 # ============================================================
 # Path resolution
 # ============================================================

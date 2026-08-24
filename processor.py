@@ -13,7 +13,13 @@ from urllib.parse import urlsplit, urlunsplit
 from openpyxl import load_workbook
 
 from models import Product, Batch, ProductStatus
-from config_manager import load_config, load_prompts, load_categories, load_banned_words
+from config_manager import (
+    load_config,
+    load_prompts,
+    load_categories,
+    load_banned_words,
+    normalize_batch_size,
+)
 from config_manager import load_category_zh, save_category_zh
 from api_client import deepseek_chat, generate_image, download_image
 from api_client import create_storage_provider
@@ -1763,7 +1769,7 @@ class ProcessingPipeline:
         title_mode = cfg.get("title_mode", "AI重写")
         prompt_text = prompts.get(self.prompt_key, prompts.get("generic", ""))
         store_profile_data = load_store_profiles()
-        batch_size = cfg.get("batch_size", 10)
+        batch_size = normalize_batch_size(cfg.get("batch_size"))
         total = len(products)
 
         # Init output workbook

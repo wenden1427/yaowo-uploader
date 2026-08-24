@@ -11,7 +11,14 @@ import threading
 import time
 
 from models import ProductStatus
-from config_manager import load_config, save_config, load_prompts, save_prompts
+from config_manager import (
+    DEFAULT_BATCH_SIZE,
+    load_config,
+    normalize_batch_size,
+    save_config,
+    load_prompts,
+    save_prompts,
+)
 from store_profiles import (
     best_category_for_text,
     category_fields,
@@ -1553,22 +1560,27 @@ class UploaderApp:
     def _open_batch_settings(self):
         """Batch size & quantity dialog."""
         cfg = load_config()
-        current_batch = cfg.get("batch_size", 10)
+        current_batch = normalize_batch_size(cfg.get("batch_size"))
         current_qty = cfg.get("default_quantity", 50)
         dlg = tk.Toplevel(self.root)
         dlg.title("处理设置")
         dlg.geometry("280x200")
         dlg.transient(self.root)
-        tb.Label(dlg, text="每批处理产品数:").pack(pady=(8, 0))
+        tb.Label(dlg, text="队列并发数（生图）:").pack(pady=(8, 0))
         batch_var = tk.IntVar(value=current_batch)
-        cb = tb.Combobox(dlg, textvariable=batch_var, values=[5, 10, 15, 20, 30], state="readonly")
+        cb = tb.Combobox(
+            dlg,
+            textvariable=batch_var,
+            values=[5, 10, 15, 20, 30, 40, DEFAULT_BATCH_SIZE],
+            state="readonly",
+        )
         cb.pack(pady=2)
         tb.Label(dlg, text="默认库存数量:").pack(pady=(8, 0))
         qty_var = tk.IntVar(value=current_qty)
         tb.Spinbox(dlg, from_=1, to=9999, textvariable=qty_var, width=10).pack(pady=2)
 
         def save():
-            cfg["batch_size"] = batch_var.get()
+            cfg["batch_size"] = normalize_batch_size(batch_var.get())
             cfg["default_quantity"] = qty_var.get()
             save_config(cfg)
             dlg.destroy()
@@ -1603,7 +1615,7 @@ routeapi Key 和 Cloudinary 配置用于生图和图片上传。
 
 ## 第三步：开始处理
 点击"开始" → 选择运行模式 → 程序自动处理。
-10 个产品为一批：生成标题/类目/价格 → AI 生图 → 写入 Excel。
+队列并发默认 50，支持在处理设置中调整为 1-50：生成标题/类目/价格 → AI 生图 → 写入 Excel。
 
 ## 运行模式
 - 全自动运行：无人值守，失败产品标红跳过

@@ -76,7 +76,9 @@ def _format_http_error(label, err, channel=None):
         body = body[:500] + "..."
     via = f" via {channel}" if channel else ""
     detail = body or getattr(err, "reason", "") or str(err)
-    return RuntimeError(f"{label} HTTP {err.code}{via}: {detail}")
+    formatted = RuntimeError(f"{label} HTTP {err.code}{via}: {detail}")
+    formatted.status_code = err.code
+    return formatted
 
 
 # ============================================================
@@ -235,29 +237,118 @@ def deepseek_translate(text, target="ko"):
 # 3. routeapi image generation
 # ============================================================
 
-def routeapi_generate(prompt, img_urls=None, model="gpt-image-2-1k", size="1024x1024"):
-    """Call 1route image-edits API to generate a product photo.
+ROUTEAPI_IMAGE_BASE_URL = "https://api.1route.dev/api/v1/images"
+ROUTEAPI_DEFAULT_MODEL = "openai/gpt-image-2"
+
+
+def _routeapi_base_url(configured_url):
+    """Normalize legacy endpoints and base URLs to the v2 image-job base URL."""
+    raw = str(configured_url or "").strip()
+    if not raw:
+        return ROUTEAPI_IMAGE_BASE_URL
+    if "://" not in raw:
+        raw = "https://" + raw
+    parts = urllib.parse.urlsplit(raw)
+    scheme = parts.scheme or "https"
+    netloc = parts.netloc
+    if (parts.hostname or "").lower() in {"api.1route.dev", "image-api.1route.dev"}:
+        netloc = "api.1route.dev"
+    path = (parts.path or "").rstrip("/")
+    if "/api/v1/images" in path:
+        path = path.split("/api/v1/images", 1)[0] + "/api/v1/images"
+    elif "/v1/images" in path:
+        path = path.split("/v1/images", 1)[0] + "/api/v1/images"
+    else:
+        path = path + "/api/v1/images"
+    return urllib.parse.urlunsplit((scheme, netloc, path, "", ""))
+
+
+def _routeapi_model_name(model):
+    value = str(model or "").strip()
+    if not value or value in {"gpt-image-2", "gpt-image-2-1k"}:
+        return ROUTEAPI_DEFAULT_MODEL
+    if value.startswith(("openai/", "google/")):
+        return value
+    return "openai/" + value.removesuffix("-1k")
+
+
+def _routeapi_request(opener, url, api_key, payload=None, method=None, timeout=60):
+    data = None
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with opener.open(req, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        raise _format_http_error("routeapi", exc, "proxy")
+    if not raw:
+        return {}
+    return json.loads(raw.decode("utf-8"))
+
+
+def _routeapi_error_message(snapshot):
+    error = snapshot.get("error") if isinstance(snapshot, dict) else None
+    if not isinstance(error, dict):
+        return str(snapshot.get("message", "") if isinstance(snapshot, dict) else "")
+    parts = [error.get("code"), error.get("type"), error.get("message")]
+    return ": ".join(str(part) for part in parts if part)
+
+
+def _routeapi_retryable_error(exc):
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        return status in {408, 409, 425, 429, 500, 502, 503, 504}
+    return isinstance(exc, (OSError, TimeoutError, urllib.error.URLError))
+
+
+def _routeapi_reference_data_urls(img_urls):
+    refs = []
+    skipped = []
+    for img_url in img_urls[:6]:
+        try:
+            image_bytes = download_image(img_url)
+            image_bytes = ensure_marketplace_image_spec(image_bytes)
+            encoded = base64.b64encode(image_bytes).decode("ascii")
+            refs.append({"dataUrl": f"data:image/jpeg;base64,{encoded}"})
+        except Exception as exc:
+            skipped.append((img_url, str(exc)))
+    if not refs:
+        detail = "; ".join(f"{url}: {error}" for url, error in skipped[:3])
+        raise ValueError(f"no reference images could be downloaded: {detail}")
+    return refs
+
+
+def routeapi_generate(prompt, img_urls=None, model=ROUTEAPI_DEFAULT_MODEL,
+                      size="1024x1024"):
+    """Generate a product photo through 1Route's asynchronous image-job API.
 
     Parameters
     ----------
     prompt : str
         Generation prompt describing the desired output.
     img_urls : str | list[str] | None
-        One or more reference image URLs (max 10 used).
+        One or more reference image URLs (max 6 used).
     model : str
-        Model name (default ``"gpt-image-2-1k"``).
+        Model name (default ``"openai/gpt-image-2"``).
     size : str
         Output size (default ``"1024x1024"``).
 
     Returns
     -------
     bytes
-        Decoded image bytes from the ``b64_json`` field of the first result.
+        Decoded bytes from the first completed job image.
 
     Raises
     ------
     Exception
-        After 3 retries the last error is re-raised.
+        If submission, polling, job execution, or result retrieval fails.
     """
     if isinstance(img_urls, str):
         img_urls = [img_urls]
@@ -265,78 +356,91 @@ def routeapi_generate(prompt, img_urls=None, model="gpt-image-2-1k", size="1024x
         img_urls = []
 
     cfg = _get_config()
-    url = cfg.get("routeapi_url", "https://api.1route.dev/v1/images/edits")
-    api_key = cfg.get("routeapi_key", "")
+    api_key = str(cfg.get("routeapi_key", "") or "").strip()
+    if not api_key:
+        raise RuntimeError("未配置 routeapi Key")
+    base_url = _routeapi_base_url(cfg.get("routeapi_url"))
+    refs = _routeapi_reference_data_urls(img_urls)
+    payload = {
+        "model": _routeapi_model_name(model),
+        "prompt": str(prompt or "").strip(),
+        "size": str(size or "auto"),
+        "images": refs,
+    }
+    opener = _make_opener(use_proxy=True)
+    submitted = _routeapi_request(
+        opener,
+        f"{base_url}/edits/jobs",
+        api_key,
+        payload=payload,
+        method="POST",
+        timeout=120,
+    )
+    job_id = str(submitted.get("jobId", "") or "").strip()
+    if not job_id:
+        raise ValueError("routeapi job submission response missing jobId")
 
-    boundary = "----FormBoundary7MA4YWxkTrZu0gW"
-
-    last_err = None
-    for attempt in range(4):  # initial + 3 retries
+    guidance = submitted.get("durationGuidance") or {}
+    try:
+        guided_timeout = float(guidance.get("timeoutSeconds", 450) or 450)
+    except (TypeError, ValueError):
+        guided_timeout = 450
+    deadline = time.monotonic() + max(180, min(guided_timeout + 60, 900))
+    status_url = f"{base_url}/jobs/{urllib.parse.quote(job_id, safe='')}"
+    poll_interval = 2.0
+    snapshot = submitted
+    poll_failures = 0
+    while time.monotonic() < deadline:
         try:
-            # --- Build multipart body ---
-            body = b""
-            for field, val in [
-                ("model", model),
-                ("prompt", prompt),
-                ("size", size),
-                ("response_format", "b64_json"),
-            ]:
-                body += (
-                    f"--{boundary}\r\n"
-                    f'Content-Disposition: form-data; name="{field}"\r\n'
-                    f"\r\n{val}\r\n"
-                ).encode()
+            snapshot = _routeapi_request(opener, status_url, api_key, timeout=60)
+            poll_failures = 0
+        except Exception as exc:
+            poll_failures += 1
+            if poll_failures <= 5 and _routeapi_retryable_error(exc):
+                time.sleep(min(poll_interval * poll_failures, 10))
+                continue
+            raise RuntimeError(
+                f"routeapi job status polling failed: {exc}"
+            ) from exc
+        phase = str(snapshot.get("phase", "") or "").lower()
+        if phase == "completed":
+            break
+        if phase in {"failed", "cancelled"}:
+            detail = _routeapi_error_message(snapshot) or phase
+            raise RuntimeError(f"routeapi job {phase}: {detail}")
+        if phase not in {"queued", "running"}:
+            raise ValueError(f"routeapi job returned unknown phase: {phase or '<empty>'}")
+        time.sleep(poll_interval)
+    else:
+        raise TimeoutError(f"routeapi job timed out after {int(max(180, min(guided_timeout + 60, 900)))}s")
 
-            # Attach reference images. Some source CDNs reject hotlink downloads;
-            # skip bad auxiliary refs instead of failing the whole generation.
-            attached = 0
-            skipped = []
-            for i, img_url in enumerate(img_urls[:10]):
-                try:
-                    img_data = download_image(img_url)
-                except Exception as e:
-                    skipped.append((img_url, str(e)))
-                    continue
-                fname = f"ref{attached}.jpg"
-                body += (
-                    f"--{boundary}\r\n"
-                    f'Content-Disposition: form-data; name="image"; filename="{fname}"\r\n'
-                    f"Content-Type: image/jpeg\r\n\r\n"
-                ).encode()
-                body += img_data + b"\r\n"
-                attached += 1
-            if attached == 0:
-                detail = "; ".join([f"{u}: {err}" for u, err in skipped[:3]])
-                raise ValueError(f"no reference images could be downloaded: {detail}")
-            body += f"--{boundary}--\r\n".encode()
-
-            headers = {
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "Authorization": f"Bearer {api_key}",
-                "User-Agent": "Mozilla/5.0",
-            }
-            req = urllib.request.Request(url, data=body, headers=headers)
-            opener = _make_opener(use_proxy=True)
-            try:
-                with opener.open(req, timeout=180) as r:
-                    resp = json.loads(r.read())
-            except urllib.error.HTTPError as e:
-                raise _format_http_error("routeapi", e, "proxy")
-
-            b64 = resp["data"][0].get("b64_json", "")
-            if b64:
-                return base64.b64decode(b64)
-            # Fallback: if the API returned a direct URL instead of b64_json
-            url_result = resp["data"][0].get("url", "")
-            if url_result:
-                return download_image(url_result)
-            raise ValueError("routeapi response missing both b64_json and url")
-
-        except Exception as e:
-            last_err = e
-            if attempt < 3:
-                time.sleep(3)
-    raise last_err
+    result = None
+    for result_attempt in range(6):
+        try:
+            result = _routeapi_request(
+                opener, f"{status_url}/result", api_key, timeout=120
+            )
+            break
+        except Exception as exc:
+            if result_attempt < 5 and _routeapi_retryable_error(exc):
+                time.sleep(min(poll_interval * (result_attempt + 1), 10))
+                continue
+            raise RuntimeError(
+                f"routeapi job result retrieval failed: {exc}"
+            ) from exc
+    images = result.get("images") if isinstance(result, dict) else None
+    if not isinstance(images, list) or not images:
+        raise ValueError("routeapi result response missing images")
+    first = images[0] if isinstance(images[0], dict) else {}
+    encoded = str(first.get("base64", "") or "")
+    if encoded:
+        if "," in encoded and encoded.lstrip().lower().startswith("data:"):
+            encoded = encoded.split(",", 1)[1]
+        return base64.b64decode(encoded)
+    result_url = str(first.get("url", "") or "").strip()
+    if result_url:
+        return download_image(urllib.parse.urljoin(base_url + "/", result_url))
+    raise ValueError("routeapi result image missing both base64 and url")
 
 
 # ============================================================
@@ -478,7 +582,7 @@ def generate_image(prompt, img_urls=None, api_choice=None,
         m = model or "gpt-image-2"
         return hfsyapi_generate(prompt, img_urls, model=m, size=size)
     else:
-        m = model or "gpt-image-2-1k"
+        m = model or ROUTEAPI_DEFAULT_MODEL
         return routeapi_generate(prompt, img_urls, model=m, size=size)
 
 

@@ -29,6 +29,44 @@ class FakeResponse:
         return json.dumps(payload).encode("utf-8")
 
 
+class JsonResponse(FakeResponse):
+    def __init__(self, payload, status=200):
+        self.payload = payload
+        self.status = status
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+
+class RouteJobOpener:
+    def __init__(self, snapshots=None, result=None, status_errors=None):
+        self.requests = []
+        self.snapshots = list(snapshots or [{"phase": "completed"}])
+        self.status_errors = list(status_errors or [])
+        self.result = result or {
+            "images": [{
+                "base64": base64.b64encode(b"image-bytes").decode("ascii"),
+                "url": "",
+                "mimeType": "image/png",
+            }],
+            "usage": {},
+        }
+
+    def open(self, req, timeout=None):
+        self.requests.append((req, timeout))
+        if req.full_url.endswith("/edits/jobs"):
+            return JsonResponse({
+                "jobId": "job_test",
+                "phase": "queued",
+                "durationGuidance": {"timeoutSeconds": 450},
+            }, status=202)
+        if req.full_url.endswith("/result"):
+            return JsonResponse(self.result)
+        if self.status_errors:
+            raise self.status_errors.pop(0)
+        return JsonResponse(self.snapshots.pop(0))
+
+
 class FakeOpener:
     def __init__(self):
         self.requests = []
@@ -173,7 +211,8 @@ class RouteApiTests(unittest.TestCase):
         calls = []
         original_routeapi_generate = getattr(api_client, "routeapi_generate", None)
 
-        def fake_routeapi_generate(prompt, img_urls=None, model="gpt-image-2-1k", size="1024x1024"):
+        def fake_routeapi_generate(prompt, img_urls=None,
+                                   model="openai/gpt-image-2", size="1024x1024"):
             calls.append((prompt, img_urls, model, size))
             return b"ok"
 
@@ -188,7 +227,12 @@ class RouteApiTests(unittest.TestCase):
                 api_client.routeapi_generate = original_routeapi_generate
 
         self.assertEqual(result, b"ok")
-        self.assertEqual(calls, [("make it clean", ["http://example.com/a.jpg"], "gpt-image-2-1k", "1024x1024")])
+        self.assertEqual(calls, [(
+            "make it clean",
+            ["http://example.com/a.jpg"],
+            "openai/gpt-image-2",
+            "1024x1024",
+        )])
 
     def test_make_opener_uses_explicit_direct_and_proxy_routes(self):
         sent_routes = []
@@ -201,11 +245,14 @@ class RouteApiTests(unittest.TestCase):
             self.assertIs(api_client._make_opener(True), sentinel)
         self.assertEqual(sent_routes, ["direct", "proxy"])
 
-    def test_routeapi_generate_sends_multipart_edit_request(self):
-        opener = FakeOpener()
+    def test_routeapi_generate_submits_and_collects_async_edit_job(self):
+        opener = RouteJobOpener(snapshots=[
+            {"phase": "running"},
+            {"phase": "completed"},
+        ])
         proxy_flags = []
         api_client._get_config = lambda: {
-            "routeapi_url": "https://api.1route.dev/v1/images/edits",
+            "routeapi_url": "https://image-api.1route.dev/v1/images/edits",
             "routeapi_key": "secret-key",
         }
 
@@ -214,24 +261,39 @@ class RouteApiTests(unittest.TestCase):
             return opener
 
         api_client._make_opener = fake_make_opener
-        api_client.download_image = lambda url: b"reference-image"
+        api_client.download_image = lambda url: make_jpeg()
 
-        result = api_client.routeapi_generate("make product photo", ["http://example.com/ref.jpg"])
+        with mock.patch.object(api_client.time, "sleep", return_value=None):
+            result = api_client.routeapi_generate(
+                "make product photo", ["http://example.com/ref.jpg"]
+            )
 
         self.assertEqual(result, b"image-bytes")
         self.assertEqual(proxy_flags, [True])
-        self.assertEqual(len(opener.requests), 1)
+        self.assertEqual(len(opener.requests), 4)
         req, timeout = opener.requests[0]
-        self.assertEqual(req.full_url, "https://api.1route.dev/v1/images/edits")
-        self.assertEqual(timeout, 180)
+        self.assertEqual(
+            req.full_url,
+            "https://api.1route.dev/api/v1/images/edits/jobs",
+        )
+        self.assertEqual(req.method, "POST")
+        self.assertEqual(timeout, 120)
         self.assertEqual(req.headers["Authorization"], "Bearer secret-key")
         self.assertIn("Mozilla/5.0", req.headers["User-agent"])
-        self.assertIn("multipart/form-data", req.headers["Content-type"])
-        self.assertIn(b'name="model"\r\n\r\ngpt-image-2-1k', req.data)
-        self.assertIn(b'name="image"; filename="ref0.jpg"', req.data)
+        self.assertEqual(req.headers["Content-type"], "application/json")
+        payload = json.loads(req.data)
+        self.assertEqual(payload["model"], "openai/gpt-image-2")
+        self.assertEqual(payload["size"], "1024x1024")
+        self.assertEqual(len(payload["images"]), 1)
+        self.assertTrue(payload["images"][0]["dataUrl"].startswith(
+            "data:image/jpeg;base64,"
+        ))
+        self.assertTrue(opener.requests[-1][0].full_url.endswith(
+            "/api/v1/images/jobs/job_test/result"
+        ))
 
     def test_routeapi_generate_skips_unreachable_reference_images(self):
-        opener = FakeOpener()
+        opener = RouteJobOpener()
         api_client._get_config = lambda: {
             "routeapi_url": "https://api.1route.dev/v1/images/edits",
             "routeapi_key": "secret-key",
@@ -241,7 +303,7 @@ class RouteApiTests(unittest.TestCase):
         def fake_download(url):
             if url.endswith("bad.jpg"):
                 raise Exception("HTTP Error 403: Forbidden")
-            return b"reference-image"
+            return make_jpeg()
 
         api_client.download_image = fake_download
 
@@ -251,10 +313,10 @@ class RouteApiTests(unittest.TestCase):
         )
 
         self.assertEqual(result, b"image-bytes")
-        self.assertEqual(len(opener.requests), 1)
+        self.assertEqual(len(opener.requests), 3)
         req, _ = opener.requests[0]
-        self.assertIn(b'filename="ref0.jpg"', req.data)
-        self.assertNotIn(b'filename="ref1.jpg"', req.data)
+        payload = json.loads(req.data)
+        self.assertEqual(len(payload["images"]), 1)
 
     def test_routeapi_generate_reports_http_403_response_body(self):
         opener = FailingOpener(b'{"error":"model not allowed"}')
@@ -263,10 +325,68 @@ class RouteApiTests(unittest.TestCase):
             "routeapi_key": "secret-key",
         }
         api_client._make_opener = lambda use_proxy: opener
-        api_client.download_image = lambda url: b"reference-image"
+        api_client.download_image = lambda url: make_jpeg()
 
         with self.assertRaisesRegex(Exception, "routeapi HTTP 403 via proxy: .*model not allowed"):
             api_client.routeapi_generate("make product photo", ["http://example.com/ref.jpg"])
+
+    def test_routeapi_generate_reports_terminal_job_error(self):
+        opener = RouteJobOpener(snapshots=[{
+            "phase": "failed",
+            "error": {
+                "code": "upstream_error",
+                "type": "upstream_error",
+                "message": "Image generation failed",
+            },
+        }])
+        api_client._get_config = lambda: {
+            "routeapi_url": "https://api.1route.dev",
+            "routeapi_key": "secret-key",
+        }
+        api_client._make_opener = lambda use_proxy: opener
+        api_client.download_image = lambda url: make_jpeg()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "routeapi job failed: upstream_error.*Image generation failed"
+        ):
+            api_client.routeapi_generate(
+                "make product photo", ["http://example.com/ref.jpg"]
+            )
+
+    def test_routeapi_status_poll_retries_without_resubmitting_job(self):
+        opener = RouteJobOpener(
+            snapshots=[{"phase": "completed"}],
+            status_errors=[urllib.error.URLError("temporary disconnect")],
+        )
+        api_client._get_config = lambda: {
+            "routeapi_url": "https://api.1route.dev",
+            "routeapi_key": "secret-key",
+        }
+        api_client._make_opener = lambda use_proxy: opener
+        api_client.download_image = lambda url: make_jpeg()
+
+        with mock.patch.object(api_client.time, "sleep", return_value=None):
+            result = api_client.routeapi_generate(
+                "make product photo", ["http://example.com/ref.jpg"]
+            )
+
+        self.assertEqual(result, b"image-bytes")
+        submit_requests = [
+            req for req, _ in opener.requests if req.full_url.endswith("/edits/jobs")
+        ]
+        self.assertEqual(len(submit_requests), 1)
+
+    def test_routeapi_legacy_url_and_model_are_normalized(self):
+        self.assertEqual(
+            api_client._routeapi_base_url(
+                "https://image-api.1route.dev/v1/images/edits"
+            ),
+            "https://api.1route.dev/api/v1/images",
+        )
+        self.assertEqual(
+            api_client._routeapi_model_name("gpt-image-2-1k"),
+            "openai/gpt-image-2",
+        )
 
     def test_legacy_provider_removed(self):
         legacy_prefix = "hao" + "ming" + "ai"
