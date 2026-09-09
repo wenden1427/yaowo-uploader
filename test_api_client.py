@@ -137,6 +137,29 @@ class TextOpener:
 
 
 class TextAIClientTests(unittest.TestCase):
+    def test_json_output_uses_existing_flash_model_and_one_request(self):
+        opener = TextOpener()
+        with mock.patch.object(api_client, "get_credential", return_value="test-key"), \
+             mock.patch.object(api_client, "_get_config", return_value={}), \
+             mock.patch.object(api_client, "_make_opener", return_value=opener):
+            api_client.deepseek_chat("Return JSON", json_mode=True)
+        self.assertEqual(len(opener.requests), 1)
+        payload = json.loads(opener.requests[0][0].data)
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertEqual(payload["model"], "qwen3.7-flash")
+        self.assertFalse(payload["enable_thinking"])
+
+    def test_json_output_keeps_existing_deepseek_compatibility(self):
+        opener = TextOpener()
+        with mock.patch.object(api_client, "get_credential", return_value=""), \
+             mock.patch.object(api_client, "_get_config", return_value={"deepseek_key": "test-key"}), \
+             mock.patch.object(api_client, "_make_opener", return_value=opener):
+            api_client.deepseek_chat("Return JSON", json_mode=True)
+        payload = json.loads(opener.requests[0][0].data)
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertEqual(payload["model"], "deepseek-chat")
+        self.assertEqual(len(opener.requests), 1)
+
     def test_bailian_is_preferred_and_disables_thinking(self):
         opener = TextOpener()
         with mock.patch.object(
@@ -153,6 +176,7 @@ class TextAIClientTests(unittest.TestCase):
         self.assertIn("dashscope.aliyuncs.com", request.full_url)
         self.assertEqual(payload["model"], "qwen3.7-flash")
         self.assertEqual(payload["max_completion_tokens"], 80)
+        self.assertNotIn("response_format", payload)
         self.assertFalse(payload["enable_thinking"])
         self.assertNotIn("encrypted-user-key", request.data.decode("utf-8"))
         self.assertEqual(timeout, 120)
