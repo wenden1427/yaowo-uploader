@@ -170,10 +170,24 @@ def init_output_workbook(template_path, output_path, cfg=None, store_id="", cate
     return twb, tws, fixed
 
 
+def require_main_image_url(value):
+    """Never treat a failed generation or the unprocessed source as an upload image."""
+    url = str(value or "").strip()
+    try:
+        parts = urlsplit(url)
+        valid = parts.scheme in {"http", "https"} and bool(parts.hostname)
+    except ValueError:
+        valid = False
+    if not valid or re.search(r"\s", url):
+        raise ValueError("主图未成功生成或上传，不能标为完成或导出；请查看该商品的生图/上传日志")
+    return url
+
+
 def write_product_row(tws, row_idx, prod, fixed, tpl_start_row, category_fixed=None):
     """Write one product row into the template sheet."""
     from openpyxl.utils import column_index_from_string
 
+    main_url = require_main_image_url(prod.result.get("Z"))
     r = tpl_start_row + row_idx
     merged_fixed = dict(fixed or {})
     merged_fixed.update(category_fixed or {})
@@ -196,7 +210,7 @@ def write_product_row(tws, row_idx, prod, fixed, tpl_start_row, category_fixed=N
     tws.cell(row=r, column=24, value=prod.result.get("X", "색상"))
     tws.cell(row=r, column=25, value=prod.result.get("Y", ""))
     # Z: main image URL
-    tws.cell(row=r, column=26, value=prod.result.get("Z", prod.main_img))
+    tws.cell(row=r, column=26, value=main_url)
     # AA: variant images
     tws.cell(row=r, column=27, value=_dedupe_csv_urls(prod.result.get("AA", "")))
     # AB: detail HTML
@@ -1661,19 +1675,26 @@ def _gen_main_image(prod, prompt, storage):
     refs = collect_generation_refs(prod)
     prod.ai_source_image_url = refs[0] if refs else ""
     prompt = build_generation_prompt(prompt)
+    from network_utils import _sanitize_text
     last_err = None
+    img_bytes = None
+    prod.result.pop("_main_image_error", None)
     for attempt in range(3):  # initial + 2 retries
+        stage = "生图" if img_bytes is None else "主图上传"
         try:
-            img_bytes = generate_image(prompt, refs)
-            img_bytes = _ensure_image_meets_spec(img_bytes)
+            if img_bytes is None:
+                img_bytes = _ensure_image_meets_spec(generate_image(prompt, refs))
+            stage = "主图上传"
             url = storage.upload(img_bytes, f"main_{prod.parent_sku}.jpg")
-            return url
+            return require_main_image_url(url)
         except Exception as e:
             last_err = e
             if attempt < 2:
-                prod.logs.append(f"{time.strftime('%H:%M:%S')} 生图失败(重试{attempt+1}): {e}")
+                action = "仅重试上传，不重复生图" if img_bytes is not None else "重试生图"
+                prod.logs.append(f"{time.strftime('%H:%M:%S')} {stage}失败(重试{attempt+1}，{action}): {_sanitize_text(e)}")
                 time.sleep(3)
-    prod.logs.append(f"{time.strftime('%H:%M:%S')} 生图失败(已重试2次): {last_err}")
+    prod.result["_main_image_error"] = _sanitize_text(f"{stage}失败: {last_err}")
+    prod.logs.append(f"{time.strftime('%H:%M:%S')} {stage}失败(已重试2次): {_sanitize_text(last_err)}")
     return None
 
 
@@ -1936,14 +1957,9 @@ class ProcessingPipeline:
                 idx = products.index(prod)
                 prod.status = ProductStatus.PHASE2_MAIN_IMG
                 self.progress_cb(idx + 1, total, f"#{idx + 1} 生图中...")
-                main_url = _gen_main_image(prod, prompt_text, storage)
-                if main_url is None:
-                    prod.status = ProductStatus.FAILED
-                    z_results[idx] = ""
-                    ab_results[idx] = ""
-                    aa_results[idx] = ""
-                    return 0, 0
+                main_url = require_main_image_url(_gen_main_image(prod, prompt_text, storage))
                 z_results[idx] = main_url
+                prod.result["Z"] = main_url
 
                 prod.status = ProductStatus.PHASE2_DETAIL
                 self.progress_cb(idx + 1, total, f"#{idx + 1} 详情图制作中...")
@@ -1961,8 +1977,14 @@ class ProcessingPipeline:
             ready_batch = [prod for prod in batch if prod.status != ProductStatus.FAILED]
             for prod in ready_batch:
                 def _runner(p=prod):
-                    r = worker(p)
-                    thread_results.append(r)
+                    try:
+                        thread_results.append(worker(p))
+                    except Exception as exc:
+                        p.status = ProductStatus.FAILED
+                        p.logs.append(f"{time.strftime('%H:%M:%S')} 图片处理失败，未导出: {exc}")
+                        idx = products.index(p)
+                        self.errors.append((idx, str(exc)))
+                        self.progress_cb(idx + 1, total, f"#{idx + 1} 图片处理失败，未导出")
                 t = threading.Thread(target=_runner)
                 threads.append(t)
                 t.start()
@@ -1982,11 +2004,11 @@ class ProcessingPipeline:
                 prod.result["Z"] = z_results.get(idx, "")
                 prod.result["AA"] = aa_results.get(idx, "")
                 prod.result["AB"] = ab_results.get(idx, "")
-                prod.status = ProductStatus.DONE
                 selected_category = getattr(prod, "store_category_id", "") or self.category_id
                 row_category_fields = category_fields(
                     self.store_id, selected_category, store_profile_data)
                 write_product_row(tws, start_row, prod, fixed, 8, row_category_fields)
+                prod.status = ProductStatus.DONE
                 start_row += 1
                 self.progress_cb(idx + 1, total, f"#{idx + 1} 已完成")
 

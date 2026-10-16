@@ -244,7 +244,7 @@ def deepseek_translate(text, target="ko"):
 # ============================================================
 
 ROUTEAPI_IMAGE_BASE_URL = "https://api.1route.dev/api/v1/images"
-ROUTEAPI_DEFAULT_MODEL = "openai/gpt-image-2"
+ROUTEAPI_DEFAULT_MODEL = "openai/gpt-image-2.5-flare-1k"
 
 
 def _routeapi_base_url(configured_url):
@@ -271,11 +271,13 @@ def _routeapi_base_url(configured_url):
 
 def _routeapi_model_name(model):
     value = str(model or "").strip()
-    if not value or value in {"gpt-image-2", "gpt-image-2-1k"}:
+    if not value:
         return ROUTEAPI_DEFAULT_MODEL
+    if value in {"gpt-image-2", "gpt-image-2-1k"}:
+        return "openai/gpt-image-2"
     if value.startswith(("openai/", "google/")):
         return value
-    return "openai/" + value.removesuffix("-1k")
+    return "openai/" + value
 
 
 def _routeapi_request(opener, url, api_key, payload=None, method=None, timeout=60):
@@ -342,7 +344,7 @@ def routeapi_generate(prompt, img_urls=None, model=ROUTEAPI_DEFAULT_MODEL,
     img_urls : str | list[str] | None
         One or more reference image URLs (max 6 used).
     model : str
-        Model name (default ``"openai/gpt-image-2"``).
+        Model name (default ``"openai/gpt-image-2.5-flare-1k"``).
     size : str
         Output size (default ``"1024x1024"``).
 

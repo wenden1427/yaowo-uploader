@@ -221,6 +221,13 @@ class TextAIClientTests(unittest.TestCase):
 
 
 class RouteApiTests(unittest.TestCase):
+    def test_model_name_preserves_explicit_flare_tier_and_old_override(self):
+        self.assertEqual(api_client._routeapi_model_name("gpt-image-2.5-flare-1k"),
+                         "openai/gpt-image-2.5-flare-1k")
+        self.assertEqual(api_client._routeapi_model_name(""), api_client.ROUTEAPI_DEFAULT_MODEL)
+        self.assertEqual(api_client._routeapi_model_name("gpt-image-2-1k"), "openai/gpt-image-2")
+        self.assertEqual(api_client._routeapi_model_name("openai/gpt-image-2"), "openai/gpt-image-2")
+
     def setUp(self):
         self._orig_get_config = api_client._get_config
         self._orig_make_opener = api_client._make_opener
@@ -236,7 +243,7 @@ class RouteApiTests(unittest.TestCase):
         original_routeapi_generate = getattr(api_client, "routeapi_generate", None)
 
         def fake_routeapi_generate(prompt, img_urls=None,
-                                   model="openai/gpt-image-2", size="1024x1024"):
+                                   model="openai/gpt-image-2.5-flare-1k", size="1024x1024"):
             calls.append((prompt, img_urls, model, size))
             return b"ok"
 
@@ -254,7 +261,7 @@ class RouteApiTests(unittest.TestCase):
         self.assertEqual(calls, [(
             "make it clean",
             ["http://example.com/a.jpg"],
-            "openai/gpt-image-2",
+            "openai/gpt-image-2.5-flare-1k",
             "1024x1024",
         )])
 
@@ -306,7 +313,7 @@ class RouteApiTests(unittest.TestCase):
         self.assertIn("Mozilla/5.0", req.headers["User-agent"])
         self.assertEqual(req.headers["Content-type"], "application/json")
         payload = json.loads(req.data)
-        self.assertEqual(payload["model"], "openai/gpt-image-2")
+        self.assertEqual(payload["model"], "openai/gpt-image-2.5-flare-1k")
         self.assertEqual(payload["size"], "1024x1024")
         self.assertEqual(len(payload["images"]), 1)
         self.assertTrue(payload["images"][0]["dataUrl"].startswith(

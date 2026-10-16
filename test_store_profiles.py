@@ -262,7 +262,7 @@ class StoreProfileTests(unittest.TestCase):
         for product in products:
             product.result.update({
                 "K": "1", "L": "2", "M": "3", "O": 100,
-                "W": "x", "X": "y", "Y": "", "Z": "z", "AA": "", "AB": "a",
+                "W": "x", "X": "y", "Y": "", "Z": "https://example.com/main.jpg", "AA": "", "AB": "a",
             })
 
         write_product_row(

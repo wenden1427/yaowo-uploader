@@ -9,6 +9,8 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
+from functools import partial
 
 from models import ProductStatus
 from config_manager import (
@@ -338,6 +340,16 @@ class UploaderApp:
             for prod in self.products:
                 if prod.parent_sku in done_skus:
                     prod.status = ProductStatus.DONE
+        from processor import require_main_image_url
+        for prod in self.products:
+            if prod.status == ProductStatus.DONE:
+                try:
+                    require_main_image_url(prod.result.get("Z"))
+                except ValueError:
+                    prod.status = ProductStatus.FAILED
+                    detail = "旧任务标记为完成，但缺少有效主图；请重新生成后导出"
+                    prod.result["_main_image_error"] = detail
+                    prod.logs.append(f"{time.strftime('%H:%M:%S')} {detail}")
         # Refresh list
         self._refresh_list()
         pending = sum(1 for p in self.products if p.status != ProductStatus.DONE)
@@ -384,7 +396,7 @@ class UploaderApp:
         sel = self._tree.selection()
         if not sel:
             return
-        idx = int(self._tree.index(sel[0]))
+        idx = int(sel[0])
         if 0 <= idx < len(self.products):
             self._show_preview(self.products[idx])
 
@@ -393,7 +405,7 @@ class UploaderApp:
         sel = self._tree.selection()
         if not sel:
             return
-        idx = int(self._tree.index(sel[0]))
+        idx = int(sel[0])
         if not (0 <= idx < len(self.products)):
             return
         self._open_category_search(self.products[idx], idx)
@@ -502,15 +514,23 @@ class UploaderApp:
         # Image pair — use Canvas for better resize control
         img_frame = tb.LabelFrame(self._preview_inner, text="主图")
         img_frame.pack(fill=tk.X, pady=(0, 8))
-        self._img_orig = tk.Canvas(img_frame, width=180, height=180, bg="#e0e0e0", relief=tk.SUNKEN)
-        self._img_orig.pack(side=tk.LEFT, padx=4, fill=tk.BOTH, expand=True)
-        self._img_gen = tk.Canvas(img_frame, width=180, height=180, bg="#e0e0e0", relief=tk.SUNKEN)
-        self._img_gen.pack(side=tk.LEFT, padx=4, fill=tk.BOTH, expand=True)
+        orig_frame = tb.Frame(img_frame)
+        orig_frame.pack(side=tk.LEFT, padx=4, fill=tk.BOTH, expand=True)
+        tb.Label(orig_frame, text="采集原图").pack()
+        self._img_orig = tk.Canvas(orig_frame, width=180, height=180, bg="#e0e0e0", relief=tk.SUNKEN)
+        self._img_orig.pack(fill=tk.BOTH, expand=True)
+        gen_frame = tb.Frame(img_frame)
+        gen_frame.pack(side=tk.LEFT, padx=4, fill=tk.BOTH, expand=True)
+        tb.Label(gen_frame, text="生成图（上架主图）").pack()
+        self._img_gen = tk.Canvas(gen_frame, width=180, height=180, bg="#e0e0e0", relief=tk.SUNKEN)
+        self._img_gen.pack(fill=tk.BOTH, expand=True)
         # Regenerate button
         regen_frame = tb.Frame(self._preview_inner)
         regen_frame.pack(fill=tk.X, pady=(0, 4))
         self._regen_btn = tb.Button(regen_frame, text="重新生成主图", command=self._regenerate_main_image)
         self._regen_btn.pack(side=tk.LEFT)
+        tb.Button(regen_frame, text="刷新图片", command=self._refresh_preview_images,
+                  bootstyle="outline-secondary").pack(side=tk.LEFT, padx=6)
         self._regen_status = tb.Label(regen_frame, text="", foreground="gray")
         self._regen_status.pack(side=tk.LEFT, padx=8)
         # Fields
@@ -543,6 +563,8 @@ class UploaderApp:
         """Populate preview panel with product data + image previews."""
         self._preview_token = getattr(self, "_preview_token", 0) + 1
         token = self._preview_token
+        self._preview_product = prod
+        self._preview_image_state = self._image_preview_state(prod)
         # Parent SKU (selectable for copy)
         self._pv_fields["parent_sku"].configure(state="normal")
         self._pv_fields["parent_sku"].delete(0, tk.END)
@@ -592,10 +614,9 @@ class UploaderApp:
         self._img_orig.create_text(90, 90, text="加载中...", fill="#888")
         self._img_gen.delete("all")
         self._img_gen.create_text(90, 90, text="加载中...", fill="#888")
-        threading.Thread(target=self._load_preview_images, args=(prod, token), daemon=True).start()
-        # Also load reference image for test panel
-        if prod.main_img:
-            threading.Thread(target=self._load_test_ref_image, args=(prod.main_img, token), daemon=True).start()
+        self._img_ref.delete("all")
+        self._img_ref.create_text(90, 90, text="加载中...", fill="#888")
+        self._load_preview_images(prod, token)
 
         var_text = prod.result.get("Y", "\n".join(
             f"{c}, {s}, 정상, 노출, 100, 100" for c, s, _ in prod.color_sizes
@@ -618,7 +639,7 @@ class UploaderApp:
         sel = self._tree.selection()
         if not sel:
             return
-        idx = int(self._tree.index(sel[0]))
+        idx = int(sel[0])
         if not (0 <= idx < len(self.products)):
             return
         prod = self.products[idx]
@@ -628,9 +649,9 @@ class UploaderApp:
 
     def _do_regen(self, idx, prod):
         try:
-            from api_client import generate_image, create_storage_provider
+            from api_client import create_storage_provider
             from config_manager import load_config, load_prompts
-            from processor import build_generation_prompt, collect_generation_refs, _ensure_image_meets_spec
+            from processor import _gen_main_image, require_main_image_url
 
             cfg = load_config()
             prompts = load_prompts()
@@ -638,29 +659,33 @@ class UploaderApp:
             prompt_text = prompts.get(prompt_key, prompts.get("generic", ""))
             storage = create_storage_provider(cfg)
 
-            refs = collect_generation_refs(prod)
-            prompt_text = build_generation_prompt(prompt_text)
-
-            img_bytes = generate_image(prompt_text, refs)
-            img_bytes = _ensure_image_meets_spec(img_bytes)
-
-            new_url = storage.upload(img_bytes, f"main_{prod.parent_sku}_regen.jpg")
+            new_url = require_main_image_url(_gen_main_image(prod, prompt_text, storage))
             prod.result["Z"] = new_url
             prod.logs.append(f"{time.strftime('%H:%M:%S')} 手动重新生成主图")
 
-            self.root.after(0, lambda: (self._show_preview(prod),
+            self.root.after(0, lambda: (self._refresh_current_preview(prod),
                                         self._regen_btn.configure(state="normal"),
                                         self._regen_status.configure(text="完成", foreground="#27ae60"),
                                         self.update_product_status(idx, prod)))
         except Exception as e:
-            self.root.after(0, lambda: (self._regen_btn.configure(state="normal"),
-                                        self._regen_status.configure(text=f"失败: {e}", foreground="#c0392b")))
+            from network_utils import _sanitize_text
+            detail = _sanitize_text(prod.result.get("_main_image_error") or str(e))
+            prod.logs.append(f"{time.strftime('%H:%M:%S')} 手动重新生成失败，未替换原主图: {detail}")
+            self.root.after(0, lambda: (
+                self._regen_btn.configure(state="normal"),
+                self._regen_status.configure(text="失败，详见处理日志", foreground="#c0392b"),
+                self._refresh_current_preview(prod)))
+
+    def _refresh_current_preview(self, prod):
+        if getattr(self, "_preview_product", None) is prod:
+            self._show_preview(prod)
 
     def _canvas_show_image(self, canvas, img_data, cache_key):
         """Display image bytes on a Canvas, scaled to fit. Main-thread only."""
         from PIL import Image
+        from image_utils import load_rgb_image
         import io as _io
-        pil_img = Image.open(_io.BytesIO(img_data))
+        pil_img = load_rgb_image(img_data)
         canvas.update_idletasks()
         cw = canvas.winfo_width() or 400
         ch = canvas.winfo_height() or 400
@@ -668,13 +693,7 @@ class UploaderApp:
             cw = 400
         if ch < 10:
             ch = 400
-        scale = min(cw / pil_img.width, ch / pil_img.height, 1.0)
-        new_w, new_h = int(pil_img.width * scale), int(pil_img.height * scale)
-        if new_w < 20:
-            new_w = 200
-        if new_h < 20:
-            new_h = 200
-        pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
+        pil_img.thumbnail((max(1, cw - 8), max(1, ch - 8)), Image.Resampling.LANCZOS)
         buf = _io.BytesIO()
         pil_img.save(buf, format="PPM")
         tk_img = tk.PhotoImage(data=buf.getvalue())
@@ -687,49 +706,149 @@ class UploaderApp:
     def _is_current_preview(self, token):
         return token == getattr(self, "_preview_token", None)
 
-    def _load_preview_images(self, prod, token):
-        """Download and display product images in preview panel (background thread)."""
-        try:
-            from api_client import download_image
-            if prod.main_img:
-                img_data = download_image(prod.main_img)
-                self.root.after(0, lambda: self._is_current_preview(token) and self._canvas_show_image(
-                    self._img_orig, img_data, prod.parent_sku + "_orig"))
-            else:
-                self.root.after(0, lambda: self._is_current_preview(token) and (
-                    self._img_orig.delete("all") or
-                    self._img_orig.create_text(90, 90, text="[无图片]", fill="#888")))
+    @staticmethod
+    def _image_preview_state(prod):
+        empty = "[尚无生成图]"
+        if prod.result.get("_main_image_error"):
+            empty = "[生图或上传失败]\n详见下方处理日志"
+        elif prod.status == ProductStatus.PHASE2_MAIN_IMG:
+            empty = "[正在生成主图...]"
+        elif prod.status == ProductStatus.DONE and not prod.result.get("Z"):
+            empty = "[缺少上架主图]\n请重新生成成功后导出"
+        return prod.main_img, prod.result.get("Z"), empty
 
-            gen_url = prod.result.get("Z", "")
-            if gen_url and gen_url.startswith("http"):
+    def _load_preview_images(self, prod, token):
+        """Start independent loads; source and test reference share the same bytes."""
+        if not hasattr(self, "_preview_bytes_cache"):
+            self._preview_bytes_cache = OrderedDict()
+        groups = {}
+        slots = [
+            (prod.main_img, self._img_orig, "原图", "preview_orig", "[无原图]"),
+            (prod.main_img, self._img_ref, "参考图", "test_ref", "[无参考图]"),
+            (prod.result.get("Z"), self._img_gen, "生成图", "preview_gen", self._image_preview_state(prod)[2]),
+        ]
+        for url, canvas, label, key, empty in slots:
+            url = str(url or "").strip()
+            if not url:
+                self._preview_canvas_message(canvas, empty)
+                continue
+            groups.setdefault(url, []).append((canvas, label, key))
+        threads = []
+        for url, targets in groups.items():
+            cached = self._preview_bytes_cache.get(url)
+            if cached and time.monotonic() - cached[0] < 300:
+                self._preview_bytes_cache.move_to_end(url)
+                self._queue_preview_result(token, prod, url, targets, cached[1])
+                continue
+            thread = threading.Thread(
+                target=self._download_preview_image,
+                args=(url, token, prod, targets), daemon=True)
+            threads.append(thread)
+            thread.start()
+        return threads
+
+    def _download_preview_image(self, url, token, prod, targets):
+        if not self._is_current_preview(token):
+            return
+        from api_client import download_image
+        try:
+            data = download_image(url)
+        except Exception as exc:
+            self._queue_preview_result(token, prod, url, targets,
+                                       error=self._preview_error_text(exc))
+        else:
+            self._queue_preview_result(token, prod, url, targets, data)
+
+    @staticmethod
+    def _preview_error_text(exc, decoding=False):
+        from network_utils import _sanitize_text, classify_network_error
+        from urllib.error import HTTPError
+        original = getattr(exc, "original", exc)
+        if decoding:
+            hint = "图片无法解码，链接可能返回了网页或不支持的格式。"
+        elif isinstance(original, HTTPError):
+            hints = {
+                403: "图片地址拒绝访问，请检查链接权限或防盗链设置。",
+                404: "图片地址不存在或已失效。",
+                429: "图片服务器限流，请稍后刷新。",
+            }
+            hint = f"HTTP {original.code}：" + hints.get(
+                original.code, "图片服务器或上游返回异常。")
+        else:
+            hints = {
+                "tls": "TLS/SSL 连接中断或证书校验失败，请检查网络、代理或证书。",
+                "dns": "域名解析失败，请检查本机 DNS 和代理状态。",
+                "timeout": "图片下载超时，请检查网络后刷新。",
+                "proxy": "代理连接失败，请检查代理是否运行及节点状态。",
+                "connect": "图片连接失败，请检查网络及代理状态。",
+            }
+            hint = hints[classify_network_error(original)]
+        return f"{hint}\n底层错误：{_sanitize_text(exc)}"
+
+    def _queue_preview_result(self, token, prod, url, targets, data=None, error=""):
+        if not self._is_current_preview(token):
+            return
+        try:
+            self.root.after(0, partial(
+                self._apply_preview_result, token, prod, url, targets, data, error))
+        except (RuntimeError, tk.TclError):
+            pass  # The application was closed while the request was in flight.
+
+    def _preview_canvas_message(self, canvas, text):
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 180)
+        height = max(canvas.winfo_height(), 180)
+        canvas.create_text(width // 2, height // 2, text=text,
+                           width=width - 16, justify=tk.CENTER, fill="#888")
+
+    def _apply_preview_result(self, token, prod, url, targets, data, error):
+        if not self._is_current_preview(token):
+            return
+        if not hasattr(self, "_preview_bytes_cache"):
+            self._preview_bytes_cache = OrderedDict()
+        from network_utils import _sanitize_text, _write_log
+        failures = []
+        for canvas, label, key in targets:
+            detail = error
+            if not detail:
                 try:
-                    img_data = download_image(gen_url)
-                    self.root.after(0, lambda: self._is_current_preview(token) and self._canvas_show_image(
-                        self._img_gen, img_data, prod.parent_sku + "_gen"))
-                except Exception:
-                    self.root.after(0, lambda: self._is_current_preview(token) and (
-                        self._img_gen.delete("all") or
-                        self._img_gen.create_text(90, 90, text="[加载失败]", fill="#888")))
-            else:
-                self.root.after(0, lambda: self._is_current_preview(token) and (
-                    self._img_gen.delete("all") or
-                    self._img_gen.create_text(90, 90, text="[待生成]", fill="#888")))
-        except Exception:
-            self.root.after(0, lambda: self._is_current_preview(token) and (
-                self._img_orig.delete("all") or
-                self._img_orig.create_text(90, 90, text="[加载失败]", fill="#888")))
+                    self._canvas_show_image(canvas, data, key)
+                except Exception as exc:
+                    detail = self._preview_error_text(exc, decoding=True)
+            if detail:
+                summary = _sanitize_text(detail.split("\n", 1)[0])[:95]
+                detail = _sanitize_text(detail)
+                self._preview_canvas_message(
+                    canvas, f"{label}加载失败\n{summary}\n可点“刷新图片”重试\n详情见处理日志")
+                failures.append(f"{label}: {detail}")
+        if failures:
+            detail = "；".join(failures)
+            _write_log(f"IMAGE_PREVIEW sku={getattr(prod, 'parent_sku', '')} url={url} detail={detail}")
+            if prod is not None:
+                prod.logs.append(f"{time.strftime('%H:%M:%S')} 预览失败（非生图状态）: {detail}")
+                self._log_text.delete("1.0", tk.END)
+                self._log_text.insert("1.0", "\n".join(prod.logs[-10:]))
+            self._preview_bytes_cache.pop(url, None)
+        elif data is not None and len(data) <= 12 * 1024 * 1024:
+            self._preview_bytes_cache[url] = (time.monotonic(), data)
+            self._preview_bytes_cache.move_to_end(url)
+            while (len(self._preview_bytes_cache) > 16 or
+                   sum(len(value[1]) for value in self._preview_bytes_cache.values()) > 12 * 1024 * 1024):
+                self._preview_bytes_cache.popitem(last=False)
+
+    def _refresh_preview_images(self):
+        prod = getattr(self, "_preview_product", None)
+        if prod is None:
+            return
+        cache = getattr(self, "_preview_bytes_cache", {})
+        cache.pop(str(prod.main_img or "").strip(), None)
+        cache.pop(str(prod.result.get("Z") or "").strip(), None)
+        self._show_preview(prod)
 
     def _load_test_ref_image(self, img_url, token):
         """Pre-load reference image for the test panel."""
-        try:
-            from api_client import download_image
-            img_data = download_image(img_url)
-            self.root.after(0, lambda: self._is_current_preview(token) and self._canvas_show_image(
-                self._img_ref, img_data, "test_ref"))
-        except Exception:
-            self.root.after(0, lambda: self._is_current_preview(token) and (
-                self._img_ref.delete("all") or
-                self._img_ref.create_text(90, 90, text="[加载失败]", fill="#888")))
+        self._download_preview_image(img_url, token, getattr(self, "_preview_product", None),
+                                     [(self._img_ref, "参考图", "test_ref")])
 
     # ============================================================
     # WAVE 5 — task-10: Test Panel (built alongside for convenience)
@@ -899,7 +1018,7 @@ class UploaderApp:
         if not sel:
             messagebox.showinfo("提示", "请先在列表中选择一个产品作为参考图来源")
             return
-        idx = int(self._tree.index(sel[0]))
+        idx = int(sel[0])
         if not (0 <= idx < len(self.products)):
             return
         prod = self.products[idx]
@@ -1735,7 +1854,7 @@ ParentSKU 并跳过，只处理剩余的。
         selected_idx = None
         sel = self._tree.selection()
         if sel:
-            selected_idx = int(self._tree.index(sel[0]))
+            selected_idx = int(sel[0])
         self._apply_platform_images()
         self._refresh_list()
         if selected_idx is not None and 0 <= selected_idx < len(self.products):
@@ -1772,6 +1891,12 @@ ParentSKU 并跳过，只处理剩余的。
                                     cat_zh or "",
                                     (prod.ai_title or prod.title)[:30]),
                             tags=(prod.status.name,))
+        if getattr(self, "_preview_product", None) is prod:
+            if getattr(self, "_preview_image_state", None) != self._image_preview_state(prod):
+                self._show_preview(prod)
+            else:
+                self._log_text.delete("1.0", tk.END)
+                self._log_text.insert("1.0", "\n".join(prod.logs[-10:]))
 
     def _on_tree_click(self, event):
         """Toggle checkbox when clicking the check column."""
@@ -1841,7 +1966,7 @@ ParentSKU 并跳过，只处理剩余的。
 
     def _do_batch_regen(self, items):
         from processor import phase1_title, phase1_category, ensure_upload_category_codes, phase1_price, phase1_w_type, phase1_x_attr, phase1_y_list
-        from processor import _gen_main_image, _gen_detail_html, _collect_variant_imgs, _get_category_zh
+        from processor import _gen_main_image, _gen_detail_html, _collect_variant_imgs, _get_category_zh, require_main_image_url
         from config_manager import load_config, load_prompts, load_categories, load_banned_words
         from api_client import create_storage_provider
 
@@ -1915,7 +2040,8 @@ ParentSKU 并跳过，只处理剩余的。
 
                 prod.status = ProductStatus.PHASE2_MAIN_IMG
                 self.root.after(0, lambda i=idx, p=prod: self.update_product_status(i, p))
-                prod.result["Z"] = _gen_main_image(prod, prompt_text, storage)
+                main_url = require_main_image_url(_gen_main_image(prod, prompt_text, storage))
+                prod.result["Z"] = main_url
                 self.root.after(0, lambda i=idx, p=prod: self.update_product_status(i, p))
 
                 prod.status = ProductStatus.PHASE2_DETAIL
@@ -1926,12 +2052,13 @@ ParentSKU 并跳过，只处理剩余的。
 
                 prod.status = ProductStatus.DONE
                 prod.logs.append(f"{time.strftime('%H:%M:%S')} [重处理] 全部完成")
-                self.root.after(0, lambda i=idx, p=prod: (self.update_product_status(i, p), self._show_preview(p)))
+                self.root.after(0, lambda i=idx, p=prod: (self.update_product_status(i, p), self._refresh_current_preview(p)))
             except Exception as e:
                 with lock:
                     errors.append((idx, str(e)))
                 prod.status = ProductStatus.FAILED
                 prod.logs.append(f"{time.strftime('%H:%M:%S')} [重处理] 失败: {e}")
+                self.root.after(0, lambda i=idx, p=prod: (self.update_product_status(i, p), self._refresh_current_preview(p)))
 
         threads = [threading.Thread(target=worker, args=(idx, prod)) for idx, prod in prods_to_regen]
         for t in threads:
@@ -1971,6 +2098,27 @@ ParentSKU 并跳过，只处理剩余的。
                 "\n".join(missing_profiles[:10]))
             return
 
+        from processor import require_main_image_url
+        missing_images = []
+        for prod in self.products:
+            if prod.status == ProductStatus.DONE:
+                try:
+                    require_main_image_url(prod.result.get("Z"))
+                except ValueError:
+                    missing_images.append(prod.parent_sku)
+        if missing_images:
+            messagebox.showerror(
+                "无法导出",
+                f"有 {len(missing_images)} 个标记为完成的商品没有有效主图。"
+                "请先重新生成成功后再导出，不能使用采集原图冒充生成图：\n" +
+                "\n".join(missing_images[:10]))
+            return
+
+        completed = [prod for prod in self.products if prod.status == ProductStatus.DONE]
+        if not completed:
+            messagebox.showinfo("无法导出", "暂无成功完成的商品；请先处理失败项并确认主图生成成功。")
+            return
+
         path = filedialog.asksaveasfilename(
             title="导出上架表", defaultextension=".xlsx",
             filetypes=[("Excel 文件", "*.xlsx")],
@@ -1988,12 +2136,11 @@ ParentSKU 并跳过，只处理剩余的。
             from processor import write_product_row, init_output_workbook
             _, _, fixed = init_output_workbook(
                 self.template_path, path, store_id=store_id)
-            for i, prod in enumerate(self.products):
-                if prod.status == ProductStatus.DONE:
-                    selected_category = getattr(prod, "store_category_id", "")
-                    write_product_row(
-                        tws, i, prod, fixed, 8,
-                        category_fields(store_id, selected_category, self._profile_data))
+            for i, prod in enumerate(completed):
+                selected_category = getattr(prod, "store_category_id", "")
+                write_product_row(
+                    tws, i, prod, fixed, 8,
+                    category_fields(store_id, selected_category, self._profile_data))
             twb.save(path)
             messagebox.showinfo("提示", f"已导出 {len([p for p in self.products if p.status == ProductStatus.DONE])} 个产品到:\n{path}")
         except Exception as e:
@@ -2053,6 +2200,7 @@ ParentSKU 并跳过，只处理剩余的。
             self._save_state()
         else:
             self.clear_saved_state()
+        self._preview_token = getattr(self, "_preview_token", 0) + 1
         self.root.destroy()
 
     # ============================================================
@@ -2175,9 +2323,13 @@ ParentSKU 并跳过，只处理剩余的。
 
     def _on_processing_done(self, ds, hm, up):
         self._processing = False
-        self._mode_var.set("处理完成")
+        done = sum(p.status == ProductStatus.DONE for p in self.products)
+        failed = sum(p.status == ProductStatus.FAILED for p in self.products)
+        pending = len(self.products) - done - failed
+        self._mode_var.set(f"处理结束：成功 {done}，失败 {failed}")
         self._pause_btn.configure(text="暂 停", state="disabled")
-        messagebox.showinfo("完成", f"处理完成！\n\n"
+        messagebox.showinfo("处理结束", f"成功 {done} 个，失败 {failed} 个，未完成 {pending} 个\n"
+                            "仅成功商品写入上架表；失败原因见商品处理日志。\n\n"
                             f"DeepSeek调用: {ds}次\n生图: {hm}张\n上传: {up}次\n\n"
                             f"输出: {self._pipeline.output_path}")
 
