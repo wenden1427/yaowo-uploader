@@ -136,6 +136,32 @@ class TextOpener:
         return TextResponse()
 
 
+class ReferenceFormatTests(unittest.TestCase):
+    def test_both_providers_normalize_negotiated_reference_formats(self):
+        from PIL import Image
+        Image.init()
+        for fmt in ("PNG", "WEBP", "AVIF"):
+            if fmt not in Image.SAVE:
+                continue
+            with self.subTest(format=fmt):
+                buf = io.BytesIO()
+                Image.new("RGB", (800, 800), "white").save(buf, format=fmt)
+                opener = FakeOpener()
+                with mock.patch.object(api_client, "_get_config", return_value={}), \
+                     mock.patch.object(api_client, "download_image", return_value=buf.getvalue()), \
+                     mock.patch.object(api_client, "_make_opener", return_value=opener):
+                    api_client.hfsyapi_generate("test", ["https://source.test/misleading.jpg"])
+                    route_refs = api_client._routeapi_reference_data_urls(["https://source.test/misleading.jpg"])
+                body = json.loads(opener.requests[0][0].data)
+                for ref in body["reference_images"] + [item["dataUrl"] for item in route_refs]:
+                    self.assertTrue(ref.startswith("data:image/jpeg;base64,"))
+                    decoded = base64.b64decode(ref.split(",", 1)[1])
+                    self.assertLessEqual(len(decoded), 300000)
+                    with Image.open(io.BytesIO(decoded)) as image:
+                        self.assertEqual(image.format, "JPEG")
+                        self.assertGreaterEqual(min(image.size), 600)
+
+
 class TextAIClientTests(unittest.TestCase):
     def test_json_output_uses_existing_flash_model_and_one_request(self):
         opener = TextOpener()

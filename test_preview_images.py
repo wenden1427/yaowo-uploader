@@ -178,14 +178,27 @@ class PreviewImagesTests(unittest.TestCase):
             (url, (time.monotonic(), b"old")) for url in (prod.main_img, prod.result["Z"], "other"))
         app._show_preview = lambda p: wait_load(app, p)
         with mock.patch.object(api_client, "download_image", return_value=b"new") as load, \
+             mock.patch.object(api_client, "invalidate_image_cache") as invalidate, \
              mock.patch.object(api_client, "generate_image") as generate, \
              mock.patch.object(api_client, "create_storage_provider") as storage:
             app._refresh_preview_images()
         self.assertEqual(load.call_count, 2)
+        self.assertCountEqual(invalidate.call_args_list,
+                              [mock.call(prod.main_img), mock.call(prod.result["Z"])])
         generate.assert_not_called()
         storage.assert_not_called()
         self.assertEqual(app._preview_bytes_cache[prod.main_img][1], b"new")
         self.assertEqual(app._preview_bytes_cache["other"][1], b"old")
+
+    def test_429_cooldown_and_decode_error_have_specific_explanations(self):
+        from image_download import ImageDownloadError
+        original = urllib.error.HTTPError("https://source.test/a", 429, "rejected", {}, None)
+        limited = ImageDownloadError("wait", original=original, retry_after=120)
+        hint = gui.UploaderApp._preview_error_text(limited)
+        self.assertIn("HTTP 429", hint)
+        self.assertIn("120", hint)
+        invalid = ImageDownloadError("bad image", invalid_image=True)
+        self.assertIn("解码", gui.UploaderApp._preview_error_text(invalid))
 
     def test_selected_preview_auto_refreshes_when_main_url_changes(self):
         app = app_for_preview()

@@ -764,16 +764,19 @@ class UploaderApp:
         from network_utils import _sanitize_text, classify_network_error
         from urllib.error import HTTPError
         original = getattr(exc, "original", exc)
-        if decoding:
+        if decoding or getattr(exc, "invalid_image", False):
             hint = "图片无法解码，链接可能返回了网页或不支持的格式。"
         elif isinstance(original, HTTPError):
             hints = {
                 403: "图片地址拒绝访问，请检查链接权限或防盗链设置。",
                 404: "图片地址不存在或已失效。",
-                429: "图片服务器限流，请稍后刷新。",
+                429: "图片服务器暂时拒绝请求，请稍后刷新。",
             }
             hint = f"HTTP {original.code}：" + hints.get(
                 original.code, "图片服务器或上游返回异常。")
+            retry_after = getattr(exc, "retry_after", None)
+            if original.code == 429 and retry_after:
+                hint = f"HTTP 429：图片服务器暂时拒绝请求，请至少 {retry_after} 秒后刷新。"
         else:
             hints = {
                 "tls": "TLS/SSL 连接中断或证书校验失败，请检查网络、代理或证书。",
@@ -841,8 +844,11 @@ class UploaderApp:
         if prod is None:
             return
         cache = getattr(self, "_preview_bytes_cache", {})
-        cache.pop(str(prod.main_img or "").strip(), None)
-        cache.pop(str(prod.result.get("Z") or "").strip(), None)
+        from api_client import invalidate_image_cache
+        for url in {str(prod.main_img or "").strip(), str(prod.result.get("Z") or "").strip()}:
+            if url:
+                cache.pop(url, None)
+                invalidate_image_cache(url)
         self._show_preview(prod)
 
     def _load_test_ref_image(self, img_url, token):

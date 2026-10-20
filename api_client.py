@@ -28,6 +28,7 @@ import urllib.request
 from abc import ABC, abstractmethod
 
 from image_utils import ensure_marketplace_image_spec
+from image_download import ImageDownloader
 from secure_credentials import get_credential
 
 DEFAULT_TENCENT_COS_BUCKET = "yaowoo-1443995558"
@@ -501,14 +502,9 @@ def hfsyapi_generate(prompt, img_urls=None, model="gpt-image-2",
     data_refs = []
     for u in (img_urls or [])[:6]:
         try:
-            img_bytes = download_image(u)
+            img_bytes = ensure_marketplace_image_spec(download_image(u))
             b64 = base64.b64encode(img_bytes).decode()
-            ext = "jpg"
-            if u.lower().endswith(".png"):
-                ext = "png"
-            elif u.lower().endswith(".webp"):
-                ext = "webp"
-            data_refs.append(f"data:image/{ext};base64,{b64}")
+            data_refs.append(f"data:image/jpeg;base64,{b64}")
         except Exception:
             continue  # skip unreachable reference images
 
@@ -598,34 +594,23 @@ def generate_image(prompt, img_urls=None, api_choice=None,
 # 5b. Image download
 # ============================================================
 
+def _log_image_download(message):
+    from network_utils import _write_log
+    _write_log(message)
+
+
+_image_downloader = ImageDownloader(
+    lambda: _make_opener(use_proxy=True), _log_image_download)
+
+
 def download_image(url):
-    """Download raw image bytes — direct first, proxy fallback.
+    """Download verified image bytes, sharing successful/in-flight requests."""
+    return _image_downloader.download(url)
 
-    Parameters
-    ----------
-    url : str
-        Image URL.
 
-    Returns
-    -------
-    bytes
-        Raw image bytes.
-
-    Raises
-    ------
-    Exception
-        On network error or timeout (30 s).
-    """
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    # Try direct first (Shein/1688 images work direct from China)
-    try:
-        with _make_opener(use_proxy=False).open(req, timeout=30) as r:
-            return r.read()
-    except Exception:
-        pass
-    # Fall back to proxy
-    with _make_opener(use_proxy=True).open(req, timeout=30) as r:
-        return r.read()
+def invalidate_image_cache(url):
+    """Refresh this image without bypassing the source server's cooldown."""
+    _image_downloader.invalidate(url)
 
 
 # ============================================================
